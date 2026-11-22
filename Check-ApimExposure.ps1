@@ -95,32 +95,72 @@ $apim | Export-Csv "$out\apim-instances.csv"
 # 1a. Scope. Microsoft's own impacted-resources list wins; otherwise Classic dedicated tiers.
 $listed = $null; $scopeSource = 'rule: Classic dedicated tiers (Developer, Basic, Standard, Premium)' + $(if ($IncludeConsumption) { ' + Consumption' } else { '' })
 function Get-ResourceName([string]$Id) { if ($Id) { ($Id.TrimEnd('/') -split '/')[-1] } }
+# Tier family from the SKU. Note: stv2/stv2.1 in platformVersion is the compute platform of the *Classic* tiers,
+# not the v2 tiers. The v2 tiers are the SKUs BasicV2, StandardV2 and PremiumV2.
+function Get-TierFamily([string]$Sku) {
+    if ($Sku -match 'V2$') { return 'v2' }
+    if ($Sku -eq 'Consumption') { return 'Classic (Consumption)' }
+    return 'Classic'
+}
+# A Microsoft list holds full resource IDs where available (preferred) and bare names otherwise.
+function New-ImpactedList { [pscustomobject]@{ ids = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                                               names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) } }
+function Add-Impacted($List, [string]$ResourceId, [string]$Name) {
+    if ($ResourceId -and $ResourceId -match '^/subscriptions/') { [void]$List.ids.Add($ResourceId.TrimEnd('/')) }
+    elseif ($Name) { [void]$List.names.Add($Name.Trim()) }
+}
+# Scope decision for one instance. $Listed is $null without a Microsoft list.
+function Get-ScopeDecision($Instance, $Listed, [switch]$IncludeConsumption) {
+    $family = Get-TierFamily $Instance.sku
+    $d = { param($in, $reason) [pscustomobject]@{ inScope = $in; tierFamily = $family; reason = $reason } }
+    if ($Listed) {
+        $isListed = $Listed.ids.Contains("$($Instance.id)".TrimEnd('/')) -or $Listed.names.Contains("$($Instance.name)")
+        if (-not $isListed) { return & $d $false 'not listed by Microsoft' }
+        # v2 tiers are not affected. A listed v2 instance was most likely migrated after the incident: keep it in
+        # scope (its secrets may have been exposed while it was Classic) but never rate it LIKELY EXPOSED.
+        if ($family -eq 'v2') { return & $d $true 'listed by Microsoft, but now a v2 tier (migrated after the incident?)' }
+        return & $d $true 'listed by Microsoft'
+    }
+    if ($family -eq 'v2') { return & $d $false 'v2 tier (not affected)' }
+    if ($family -eq 'Classic (Consumption)' -and -not $IncludeConsumption) { return & $d $false 'Consumption tier: not listed by Microsoft in the tenants checked (-IncludeConsumption to include)' }
+    return & $d $true "Classic dedicated tier (platform $(if ($Instance.platformVersion) { $Instance.platformVersion } else { 'unknown' }))"
+}
+
+# Status for an in-scope instance. A v2-tier instance is never rated LIKELY EXPOSED (it is only in scope when
+# Microsoft lists it, i.e. it was Classic during the incident and has been migrated since).
+function Get-InstanceStatus([switch]$Unchecked, [string]$TierFamily, [switch]$NoNetwork, [switch]$SecretsHeld) {
+    if ($Unchecked) { return 'UNCHECKED' }
+    if ($TierFamily -eq 'v2') { return 'REVIEW (v2 tier)' }
+    if ($NoNetwork -or $SecretsHeld) { return 'LIKELY EXPOSED' }
+    return 'REVIEW'
+}
+
 if ($ImpactedResourcesCsv) {
     # The portal export's column names vary; accept a resource ID column, or a service/resource name column
-    $listed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $listed = New-ImpactedList
     foreach ($r in @(Import-Csv $ImpactedResourcesCsv)) {
         $cols = @{}; foreach ($p in $r.PSObject.Properties) { $cols[($p.Name -replace '[\s_]', '').ToLower()] = "$($p.Value)".Trim() }
-        $nm = if ($cols['resourceid']) { Get-ResourceName $cols['resourceid'] } elseif ($cols['targetresourceid']) { Get-ResourceName $cols['targetresourceid'] }
-              elseif ($cols['servicename']) { $cols['servicename'] } elseif ($cols['resourcename']) { $cols['resourcename'] } else { $cols['name'] }
-        if ($nm) { [void]$listed.Add($nm) }
+        $rid = if ($cols['resourceid']) { $cols['resourceid'] } else { $cols['targetresourceid'] }
+        $nm = if ($cols['servicename']) { $cols['servicename'] } elseif ($cols['resourcename']) { $cols['resourcename'] } else { $cols['name'] }
+        Add-Impacted $listed $rid $nm
     }
-    if (-not $listed.Count) { throw "No resource names found in $ImpactedResourcesCsv (expected a 'Resource ID', 'Service Name' or 'Resource Name' column)." }
-    $scopeSource = "Microsoft's impacted-resources list from $ImpactedResourcesCsv ($($listed.Count) resources)"
+    if (-not ($listed.ids.Count + $listed.names.Count)) { throw "No resources found in $ImpactedResourcesCsv (expected a 'Resource ID', 'Service Name' or 'Resource Name' column)." }
+    $scopeSource = "Microsoft's impacted-resources list from $ImpactedResourcesCsv ($($listed.ids.Count + $listed.names.Count) resources)"
 } else {
     $events = @(Invoke-Graph "servicehealthresources | where type =~ 'microsoft.resourcehealth/events' | extend p = properties | where tostring(p.EventType) =~ 'SecurityAdvisory' and tostring(p.Title) contains 'API Management' and tostring(p.Title) contains 'Classic' | project trackingId = name, subscriptionId, title = tostring(p.Title)" $subs)
     if ($events.Count) {
-        $tmp = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); $denied = @()
+        $tmp = New-ImpactedList; $denied = @()
         foreach ($e in $events) {
             $url = "https://management.azure.com/subscriptions/$($e.subscriptionId)/providers/Microsoft.ResourceHealth/events/$($e.trackingId)/listSecurityAdvisoryImpactedResources?api-version=2022-10-01"
             while ($url) {
                 $res = Invoke-Arm POST $url
                 if (-not $res.ok) { $denied += $e.subscriptionId; break }
-                foreach ($v in @($res.data.value)) { $nm = Get-ResourceName "$($v.properties.targetResourceId)"; if ($nm) { [void]$tmp.Add($nm) } }
+                foreach ($v in @($res.data.value)) { $tr = "$($v.properties.targetResourceId)"; Add-Impacted $tmp $tr (Get-ResourceName $tr) }
                 $url = $res.data.nextLink
             }
         }
         $ids = (@($events.trackingId) | Sort-Object -Unique) -join ', '
-        if (-not $denied.Count) { $listed = $tmp; $scopeSource = "Microsoft's impacted-resources list (Service Health advisory $ids, $($listed.Count) resources)" }
+        if (-not $denied.Count) { $listed = $tmp; $scopeSource = "Microsoft's impacted-resources list (Service Health advisory $ids, $($listed.ids.Count + $listed.names.Count) resources)" }
         else {
             Write-Warning ("Service Health advisory $ids found, but its impacted-resources list could not be read for $(@($denied | Sort-Object -Unique).Count) subscription(s). " +
                 "That needs e.g. Owner/Contributor or a role with Microsoft.ResourceHealth/events/fetchEventDetails/action. " +
@@ -129,25 +169,24 @@ if ($ImpactedResourcesCsv) {
     }
 }
 $scope = foreach ($i in $apim) {
-    $in = $false
-    $reason = if ($listed) { if ($listed.Contains($i.name)) { $in = $true; 'listed by Microsoft' } else { 'not listed by Microsoft' } }
-              elseif ($i.sku -match 'V2$') { 'v2 tier (not affected)' }
-              elseif ($i.sku -eq 'Consumption' -and -not $IncludeConsumption) { 'Consumption tier: not listed by Microsoft in the tenants checked (-IncludeConsumption to include)' }
-              else { $in = $true; 'Classic dedicated tier' }
-    [pscustomobject]@{ id = $i.id; name = $i.name; subscriptionId = $i.subscriptionId; sku = $i.sku; platformVersion = $i.platformVersion
-                       inScope = $in; reason = $reason; scopeSource = $(if ($listed) { 'microsoft' } else { 'rule' }) }
+    $dec = Get-ScopeDecision $i $listed -IncludeConsumption:$IncludeConsumption
+    [pscustomobject]@{ id = $i.id; name = $i.name; subscriptionId = $i.subscriptionId; sku = $i.sku; tierFamily = $dec.tierFamily; platformVersion = $i.platformVersion
+                       inScope = $dec.inScope; reason = $dec.reason; scopeSource = $(if ($listed) { 'microsoft' } else { 'rule' }) }
 }
 $scope | Export-Csv "$out\scope.csv"
 $inScopeIds = @($scope | Where-Object inScope | ForEach-Object { $_.id })
 $classic = @($apim | Where-Object { $_.id -in $inScopeIds })
 $outOfScope = @($scope | Where-Object { -not $_.inScope })
 Write-Host "Scope: $scopeSource"
+if (-not $listed) { Write-Host 'Note: stv2/stv2.1 (platformVersion) is the compute platform of the Classic tiers, not the v2 tiers (BasicV2/StandardV2/PremiumV2).' -ForegroundColor DarkGray }
 Write-Host "APIM instances: $($apim.Count) total, $($classic.Count) in scope, $($outOfScope.Count) out of scope"
-$classic | Format-Table name, subscriptionId, sku, platformVersion, vnetType, publicAccess, privateEndpoints -AutoSize
-if ($outOfScope.Count) { $outOfScope | Format-Table name, sku, platformVersion, reason -AutoSize }
+$scope | Where-Object inScope | Format-Table name, subscriptionId, sku, tierFamily, platformVersion, reason -AutoSize
+if ($outOfScope.Count) { $outOfScope | Format-Table name, sku, tierFamily, platformVersion, reason -AutoSize }
+$v2Listed = @($scope | Where-Object { $_.inScope -and $_.tierFamily -eq 'v2' })
+if ($v2Listed.Count) { Write-Warning "Listed by Microsoft but now a v2 tier (rated REVIEW, not LIKELY EXPOSED): $($v2Listed.name -join ', '). Check whether they were migrated from Classic after the incident." }
 if ($listed) {
-    $unknown = @($listed | Where-Object { $_ -notin @($apim.name) })
-    if ($unknown.Count) { Write-Warning "Listed by Microsoft but not visible to this account: $($unknown -join ', ')" }
+    $unknown = @(@($listed.ids | Where-Object { $_ -notin @($apim | ForEach-Object { "$($_.id)".TrimEnd('/') }) }) + @($listed.names | Where-Object { $_ -notin @($apim.name) }))
+    if ($unknown.Count) { Write-Warning "Listed by Microsoft but not visible to this account: $(($unknown | ForEach-Object { Get-ResourceName $_ }) -join ', ')" }
 }
 
 # 1b. Preflight: direct per-subscription check. Resource Graph silently hides what you can't read;
@@ -324,9 +363,9 @@ $summary = foreach ($i in $classic) {
     $ti = $tenantInfo[$i.id]
     $pe = [int]$i.privateEndpoints
     $noNet = ($i.vnetType -eq 'None' -and $pe -eq 0)
-    $status = if ($nvFailed -or $otherFailed) { 'UNCHECKED' }
-              elseif ($noNet -or $inApim -gt 0 -or $certsInApim -gt 0 -or $clientSecretObjs -gt 0) { 'LIKELY EXPOSED' }
-              else { 'REVIEW' }
+    $sc = $scope | Where-Object id -eq $i.id | Select-Object -First 1
+    $status = Get-InstanceStatus -Unchecked:($nvFailed -or $otherFailed) -TierFamily $sc.tierFamily -NoNetwork:$noNet `
+                                 -SecretsHeld:($inApim -gt 0 -or $certsInApim -gt 0 -or $clientSecretObjs -gt 0)
     $row = [pscustomobject]@{
         status = $status; apim = $i.name; subscriptionId = $i.subscriptionId; sku = $i.sku
         vnetType = $i.vnetType; publicAccess = $i.publicAccess; privateEndpoints = $pe
@@ -338,7 +377,7 @@ $summary = foreach ($i in $classic) {
         directMgmtApi = if ($ti) { $ti.directMgmtApi } else { 'unknown' }
         gitAccess = if ($ti) { $ti.gitAccess } else { 'unknown' }
         hasManagedIdentity = (@($instPrincipals[$i.id]).Count -gt 0)
-        platformVersion = $i.platformVersion; scope = ($scope | Where-Object id -eq $i.id).reason
+        tierFamily = $sc.tierFamily; platformVersion = $i.platformVersion; scope = $sc.reason
     }
     $color = switch ($status) { 'UNCHECKED' { 'Red' } 'LIKELY EXPOSED' { 'Yellow' } default { 'Gray' } }
     Write-Host ("{0,-15} {1} [{2}] {3} | vnet={4} public={5} PE={6} | secrets in APIM: {7}, in Key Vault: {8}, logger creds: {9}, certs in APIM: {10}, client-secret objects: {11} | active subscriptions: {12} | direct mgmt API: {13}, git: {14} | identity: {15}" -f `
@@ -354,7 +393,7 @@ $summary = @($summary) + @(foreach ($o in $outOfScope) {
         status = 'OUT OF SCOPE'; apim = $o.name; subscriptionId = $o.subscriptionId; sku = $o.sku
         vnetType = $a.vnetType; publicAccess = $a.publicAccess; privateEndpoints = [int]$a.privateEndpoints
         secretsInApim = ''; secretsInKeyVault = ''; loggerCredentials = ''; certsInApim = ''; clientSecretObjects = ''; activeSubscriptions = ''
-        directMgmtApi = ''; gitAccess = ''; hasManagedIdentity = ''; platformVersion = $o.platformVersion; scope = $o.reason
+        directMgmtApi = ''; gitAccess = ''; hasManagedIdentity = ''; tierFamily = $o.tierFamily; platformVersion = $o.platformVersion; scope = $o.reason
     }
 })
 foreach ($o in $outOfScope) { Write-Host ("{0,-15} {1} {2} ({3})" -f 'OUT OF SCOPE', $o.name, $o.sku, $o.reason) -ForegroundColor DarkGray }
@@ -367,6 +406,9 @@ Legend: LIKELY EXPOSED = no VNet/private endpoint and/or secrets held by APIM (m
                  'Network security' requirements and check Key Vault access (the managed identity may still reach vaults).
         UNCHECKED = named values, certificates or client-secret objects could not be read (see failed-calls.csv).
         OUT OF SCOPE = not listed by Microsoft, or (without a Microsoft list) a v2 or Consumption instance. See scope.csv.
+        REVIEW (v2 tier) = listed by Microsoft but now a v2 tier (BasicV2/StandardV2/PremiumV2), probably migrated after the
+                 incident. Its secrets may have been exposed while it was Classic; v2 itself is not affected.
+        Tier family vs platform: stv2/stv2.1 is the compute platform of the Classic tiers, not the v2 tiers.
         Logger creds = Application Insights logger credentials APIM created itself; shown separately, not used in the status.
         Subscription keys exist on every instance with active subscriptions; direct mgmt API = True means management
         tokens could be issued. Both are listed for rotation planning, not used in the status.

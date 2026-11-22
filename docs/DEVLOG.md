@@ -2,6 +2,20 @@
 
 Development notes for the scripts. Newest entries first. This log records what changed in the code and why. It never contains data or findings from any environment the scripts were run against.
 
+## 2026-11-22: stv2 is not v2; v2 instances never rated LIKELY EXPOSED
+
+**Report:** a user saw instances on platform `stv2.1` rated `LIKELY EXPOSED` and read that as "v2 instances". `stv1`/`stv2`/`stv2.1` is the compute platform of the **Classic** tiers. The v2 tiers are the SKUs `BasicV2`, `StandardV2` and `PremiumV2`. The user couldn't read the advisory, so the tier rule applied, and their instances were Classic dedicated tiers: in scope by design. In the tenant we tested, every instance Microsoft listed was a Classic tier on stv2.1.
+
+**Real bug found while checking:** the path that uses Microsoft's list matched on instance **name only** and never looked at the tier. A v2 instance on the list would therefore be put in scope and, typically having no VNet, rated `LIKELY EXPOSED`. Our test tenant had no v2 instances, so this path had never run with one.
+
+**Changes:**
+- **Testable functions.** The scope and status decisions are now functions in `Check-ApimExposure.ps1`: `Get-TierFamily`, `Get-ScopeDecision` and `Get-InstanceStatus`.
+- **Listed v2 instances.** A v2 instance on Microsoft's list stays in scope (it was probably migrated after the incident) but is rated `REVIEW (v2 tier)`, never `LIKELY EXPOSED`, and the script warns about it.
+- **Resource ID matching.** Microsoft's list is matched on full resource ID where available (CSV `Resource ID` column, or the API's `targetResourceId`), and on name otherwise.
+- **Clearer output.** `tierFamily` is added to `scope.csv` and `summary.csv`. The fallback rule prints that stv2 is the Classic platform, and the legend and README say so too.
+- **Tests.** `tests/Scope.Tests.ps1` holds offline Pester 5 tests, loaded from the script's own AST so the script stays a single file. They cover every SKU, Classic on stv1/stv2.1, Consumption, the Microsoft list (resource ID, name, other subscription, listed v2) and the status rules.
+- **CI.** `.github/workflows/tests.yml` checks that all scripts parse and runs the tests on every pull request and on pushes to main.
+
 ## 2026-11-22: Scope follows Microsoft's impacted-resources list
 
 **Problem:** the scripts treated every Classic instance as in scope, Consumption included, because Microsoft's notice lists Consumption among the Classic tiers. In a real tenant, the advisory's **Impacted Resources** list held only the dedicated-tier instances: Developer, Basic and Standard, all on platform `stv2.1`. All Consumption (`mtv1`) instances were absent. Counting them added instances, secrets, subscriptions and even Key Vaults that Microsoft did not consider impacted.
