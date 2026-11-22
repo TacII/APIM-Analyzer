@@ -3,6 +3,14 @@ apim-exposure/
 kv-audit/
 *.csv
 *.json
+# Archives and spreadsheets of the output (e.g. zipped results to send to someone)
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+*.xlsx
+*.xls
 
 # Local / editor files
 .vscode/
