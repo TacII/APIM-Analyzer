@@ -239,8 +239,8 @@ function Invoke-La([string]$ws, [string]$kql) {
     }
 }
 # Both Key Vault log schemas, normalised. Column names are case-sensitive:
-#   AzureDiagnostics: ResourceId, CallerIPAddress, identity_claim_oid_g (or the long objectidentifier claim), id_s
-#   AZKVAuditLogs:    _ResourceId, CallerIpAddress, Identity.claim.oid (or the long objectidentifier claim), Id
+#   AzureDiagnostics: ResourceId, CallerIPAddress, identity_claim_oid_g (or the long objectidentifier claim), id_s, httpStatusCode_d
+#   AZKVAuditLogs:    _ResourceId, CallerIpAddress, Identity.claim.oid (or the long objectidentifier claim), Id, HttpStatusCode
 function Build-Src($vaultIds) {
     $vl = ($vaultIds | ForEach-Object { "'" + $_.ToLower() + "'" }) -join ','
     @"
@@ -250,13 +250,15 @@ let src = union isfuzzy=true
      | project TimeGenerated, Source = 'AzureDiagnostics', ResourceId = tolower(ResourceId), OperationName,
          CallerIP = tostring(column_ifexists('CallerIPAddress', '')),
          Oid = tolower(coalesce(tostring(column_ifexists('identity_claim_oid_g', '')), tostring(column_ifexists('identity_claim_http_schemas_microsoft_com_identity_claims_objectidentifier_g', '')))),
-         ItemId = tostring(column_ifexists('id_s', ''))),
+         ItemId = tostring(column_ifexists('id_s', '')),
+         Http = toint(column_ifexists('httpStatusCode_d', real(null)))),
   (AZKVAuditLogs
      | extend Claim = parse_json(tostring(Identity)).claim
      | project TimeGenerated, Source = 'AZKVAuditLogs', ResourceId = tolower(_ResourceId), OperationName,
          CallerIP = tostring(CallerIpAddress),
          Oid = tolower(coalesce(tostring(Claim.oid), tostring(Claim['http://schemas.microsoft.com/identity/claims/objectidentifier']))),
-         ItemId = tostring(Id))
+         ItemId = tostring(Id),
+         Http = toint(HttpStatusCode))
   | where ResourceId in (vaultIds);
 
 "@
@@ -268,7 +270,9 @@ $w = 0
 foreach ($g in $byWs) {
     $w++; Write-Host "Querying workspace $w/$($byWs.Count): $($g.Name)"
     $src = Build-Src @($g.Group.vaultId)
-    $q1 = $src + "src | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated), Sources=strcat_array(make_set(Source), ','), MissingIp=countif(isempty(CallerIP)), MissingOid=countif(isempty(Oid)) by ResourceId"
+    # Missing IP / object ID only counts on authenticated data-plane calls. 401 'Authentication' challenges and
+    # control-plane operations (VaultGet, AccessPolicy*, ...) never carry an object ID, so they would only add noise.
+    $q1 = $src + "src | extend DataPlane = (OperationName startswith 'Secret' or OperationName startswith 'Key' or OperationName startswith 'Certificate') and coalesce(Http, 0) != 401 | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated), Sources=strcat_array(make_set(Source), ','), DataPlaneEvents=countif(DataPlane), MissingIp=countif(DataPlane and isempty(CallerIP)), MissingOid=countif(DataPlane and isempty(Oid)) by ResourceId"
     $q2 = $src + "src | where Oid in (dynamic([$plist])) | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated) by ResourceId, Oid, CallerIP, OperationName"
     $q3 = $src + "let ops = dynamic(['SecretGet','SecretList','SecretBackup','SecretListVersions','KeyGet','KeyList','KeyBackup','CertificateGet','CertificateList','CertificateBackup']); let base = src | where TimeGenerated < datetime($ws0) | distinct ResourceId, Oid, CallerIP; src | where TimeGenerated >= datetime($ws0) and TimeGenerated < datetime($we0) and OperationName in (ops) | summarize Events=count(), DistinctItems=dcount(ItemId), First=min(TimeGenerated), Last=max(TimeGenerated), Ops=tostring(make_set(OperationName)) by ResourceId, Oid, CallerIP | join kind=leftanti base on ResourceId, Oid, CallerIP | order by Events desc"
     try {
@@ -278,7 +282,20 @@ foreach ($g in $byWs) {
     } catch { $qerr[$g.Name] = "$($_.Exception.Message)"; Write-Warning "Query failed for $($g.Name): $($qerr[$g.Name])" }
 }
 foreach ($c in @($cov | Where-Object { [int]$_.MissingIp -gt 0 -or [int]$_.MissingOid -gt 0 })) {
-    Write-Warning "$($c.ResourceId): $($c.MissingIp) of $($c.Events) log rows have no caller IP and $($c.MissingOid) have no object ID ($($c.Sources)). Check the column mapping in Build-Src for this workspace."
+    Write-Warning "$($c.ResourceId): of $($c.DataPlaneEvents) authenticated data-plane log rows, $($c.MissingIp) have no caller IP and $($c.MissingOid) have no object ID ($($c.Sources)). Check the column mapping in Build-Src for this workspace."
+}
+# Logs that start later than the requested lookback usually mean the workspace keeps less than that (often 30 days).
+# The baseline of "known callers" is then shorter, so more callers look new, and the incident window will age out.
+$nowUtc = [DateTime]::UtcNow
+foreach ($c in $cov) {
+    $first = ([datetimeoffset]$c.First).UtcDateTime
+    $have = ($nowUtc - $first).TotalDays
+    if ($have -lt $LookbackDays - 2) {
+        $baseline = ($WindowStart - $first).TotalDays
+        $agesOut = $WindowStart.AddDays([Math]::Floor($have))
+        Write-Warning ("{0}: logs only go back to {1:yyyy-MM-dd} ({2:N0} of {3} days requested), probably the workspace's retention. Baseline before the window: {4:N0} days. At this retention, the window's first day ages out around {5:yyyy-MM-dd} - export or extend retention before then." -f `
+            $c.ResourceId, $first, $have, $LookbackDays, [Math]::Max(0, $baseline), $agesOut)
+    }
 }
 
 # Flag APIM-identity activity coming from an address that is not one of that instance's own IPs
@@ -314,6 +331,7 @@ $verdicts = foreach ($l in $logging) {
         status = $status; vault = $l.vault; subscriptionId = $l.subscriptionId
         logsFrom = if ($c) { $c.First } else { $null }; logEvents = if ($c) { $c.Events } else { 0 }
         logSources = if ($c) { $c.Sources } else { '' }
+        baselineDays = if ($c) { [Math]::Round([Math]::Max(0, ($WindowStart - ([datetimeoffset]$c.First).UtcDateTime).TotalDays), 1) } else { $null }
         apimIdentityEvents = ($pa | Measure-Object Events -Sum).Sum; unexpectedIpRows = $unexp
         newCallersInWindow = $nc.Count; note = $l.note
     }
@@ -333,6 +351,9 @@ How to read this:
                window read secrets/keys/certs inside it. New pairs can be benign (new admin IP, new service);
                look at new-callers-in-window.csv and apim-identity-activity.csv before concluding anything.
   REVIEW     = APIM identity activity whose source IP cannot be checked (no static IP, or no IP in the log row).
+  baselineDays (in vault-verdicts.csv) = how many days of logs exist before the window. A short baseline (e.g. a
+               workspace that keeps 30 days) makes ordinary callers - CI agents on changing IPs, admins on a new
+               network - show up as new. Check the client (user agent) and history before concluding anything.
   'no anomaly found' only covers the period the logs cover (see logsFrom) and only data that was logged.
   Anything 'cannot assess' / PARTIAL means there is no evidence either way - treat as potentially accessed.
   Absence of events is not proof of safety: the described legacy API had no logging, but its use of a
