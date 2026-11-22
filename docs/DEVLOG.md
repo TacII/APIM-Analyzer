@@ -2,6 +2,21 @@
 
 Development notes for the scripts. Newest entries first. This log records what changed in the code and why. It never contains data or findings from any environment the scripts were run against.
 
+## 2026-11-22: Scope follows Microsoft's impacted-resources list
+
+**Problem:** the scripts treated every Classic instance as in scope, Consumption included, because Microsoft's notice lists Consumption among the Classic tiers. In a real tenant, the advisory's **Impacted Resources** list held only the dedicated-tier instances: Developer, Basic and Standard, all on platform `stv2.1`. All Consumption (`mtv1`) instances were absent. Counting them added instances, secrets, subscriptions and even Key Vaults that Microsoft did not consider impacted.
+
+**Fix:**
+- **Microsoft's list first.** `Check-ApimExposure.ps1` uses Microsoft's list when it can get it:
+  - `-ImpactedResourcesCsv` reads the portal's Export to CSV, matching on a resource ID column, else on service or resource name;
+  - otherwise it finds the advisory in Resource Graph (`servicehealthresources`, event type `SecurityAdvisory`) and calls `listSecurityAdvisoryImpactedResources`.
+  - That API needs more than Reader. On a 403 the script warns and explains how to export the list instead.
+- **Fallback rule.** Without a list, only Classic dedicated tiers are in scope, and `-IncludeConsumption` adds Consumption back.
+- **`scope.csv`.** The decision per instance is written to `scope.csv`, together with `platformVersion`. Out-of-scope instances appear in `summary.csv` as `OUT OF SCOPE` with the reason.
+- **Shared scope.** `Check-KeyVaultAudit.ps1` and `Analyze-Findings.ps1` read `scope.csv` when present, with the same rule as fallback, so all three scripts use the same set.
+
+Platform version can't be the criterion: the listed instances were all `stv2.1`, and none was `stv1`.
+
 ## 2026-11-22: Follow-up analysis script (`Analyze-Findings.ps1`)
 
 This automates the manual follow-up that was needed after a real run. It reads the output of the two scripts and makes read-only calls to Entra ID, Log Analytics and Resource Manager.

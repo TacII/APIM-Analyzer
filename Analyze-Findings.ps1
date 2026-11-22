@@ -108,9 +108,18 @@ $instances = Read-Csv (Join-Path $ExposureDir 'apim-instances.csv')
 $summary   = Read-Csv (Join-Path $ExposureDir 'summary.csv')
 $nv        = Read-Csv (Join-Path $ExposureDir 'named-values.csv')
 $subsCsv   = Read-Csv (Join-Path $ExposureDir 'apim-subscriptions.csv')
-$classic   = @($instances | Where-Object { $_.sku -notmatch 'V2$' })
+$scopeCsv  = Read-Csv (Join-Path $ExposureDir 'scope.csv')
+# In-scope instances as decided by Check-ApimExposure.ps1 (Microsoft's list or the tier rule); older output
+# without scope.csv falls back to Classic dedicated tiers.
+$classic = if ($scopeCsv.Count) {
+    $ids = @($scopeCsv | Where-Object { $_.inScope -eq 'True' } | ForEach-Object { $_.id })
+    @($instances | Where-Object { $_.id -in $ids })
+} else { @($instances | Where-Object { $_.sku -notmatch 'V2$' -and $_.sku -ne 'Consumption' }) }
 $envOf = @{}; foreach ($i in $classic) { $envOf[$i.name] = Get-InstanceEnv $i.name }
-Write-Host "Classic instances: $($classic.Count) ($(@($classic | Where-Object { Test-Prod $envOf[$_.name] }).Count) production by name)"
+Write-Host "Instances in scope: $($classic.Count) ($(@($classic | Where-Object { Test-Prod $envOf[$_.name] }).Count) production by name)"
+$scopeNames = @($classic.name)
+$nv = @($nv | Where-Object { $_.apim -in $scopeNames })
+$subsCsv = @($subsCsv | Where-Object { $_.apim -in $scopeNames })
 
 $nvRows = foreach ($v in $nv) {
     $dn = if ($v.displayName) { $v.displayName } else { $v.namedValue }
@@ -395,7 +404,8 @@ Generated $($snapshot.generated) by Analyze-Findings.ps1 (read-only). Window $($
 
 | Item | Value |
 |---|---|
-| Classic instances | $($classic.Count) ($(@($classic | Where-Object { Test-Prod $envOf[$_.name] }).Count) production by name) |
+| Instances in scope | $($classic.Count) ($(@($classic | Where-Object { Test-Prod $envOf[$_.name] }).Count) production by name)$(if ($scopeCsv.Count) { "; scope source: $(@($scopeCsv.scopeSource | Sort-Object -Unique) -join ', ')" }) |
+| Instances out of scope | $(@($scopeCsv | Where-Object { $_.inScope -ne 'True' }).Count) |
 | Instances rated LIKELY EXPOSED | $(@($summary | Where-Object status -eq 'LIKELY EXPOSED').Count) |
 | Secrets held by APIM (excluding logger credentials) | $($heldSecrets.Count) |
 | Active subscriptions | $(@($subRows).Count) (all-access or all-API: $($snapshot.allAccess)) |
