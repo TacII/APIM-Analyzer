@@ -1,0 +1,12 @@
+# Script output contains real resource names, IDs and IP addresses. Never commit it.
+apim-exposure/
+kv-audit/
+*.csv
+*.json
+
+# Local / editor files
+.vscode/
+.idea/
+*.log
+*.tmp
+.DS_Store
