@@ -3,6 +3,9 @@
 Checks every enabled subscription you can see for Azure API Management Classic instances
 and writes CSVs to .\apim-exposure\ . Read-only. Needs Reader on the subscriptions.
 Run `az login` first (az CLI).
+
+Author:  Mathias Haas, Fidelity Consulting AB
+Contact: bWF0aGlhcy5oYWFzQGZpZGVsaXR5Y29uc3VsdGluZy5zZQ== (base64)
 #>
 $ErrorActionPreference = 'Stop'
 $out = Join-Path $PWD 'apim-exposure'

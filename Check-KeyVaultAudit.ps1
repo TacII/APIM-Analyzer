@@ -5,6 +5,9 @@ vault contents around the APIM incident (18-19 Nov 2026). Standalone and read-on
 
 Needs: Reader on the subscriptions, and Log Analytics Reader on the workspaces that hold the vault logs.
 Run `az login` first. Output goes to .\kv-audit\
+
+Author:  Mathias Haas, Fidelity Consulting AB
+Contact: bWF0aGlhcy5oYWFzQGZpZGVsaXR5Y29uc3VsdGluZy5zZQ== (base64)
 #>
 param(
     [string]$OutDir = (Join-Path $PWD 'kv-audit'),

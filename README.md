@@ -83,6 +83,12 @@ Output goes to `./apim-exposure/` and `./kv-audit/` as CSV files. These contain 
 
 Issues and pull requests are welcome, especially fixes for schema differences and other platforms. Please do not include real tenant data in issues or pull requests.
 
+## Author
+
+Mathias Haas, Fidelity Consulting AB
+
+Contact (base64-encoded): `bWF0aGlhcy5oYWFzQGZpZGVsaXR5Y29uc3VsdGluZy5zZQ==`
+
 ## License
 
 No license has been chosen yet. Until one is added, all rights are reserved by the author.
