@@ -21,6 +21,7 @@ Because the exact reach of the issue is not fully documented, these tools also l
 |---|---|
 | `Check-ApimExposure.ps1` | Finds APIM instances across all subscriptions you can read, flags Classic tiers, and checks network settings. Lists named values, certificates, identity providers and other secret-bearing objects, APIM subscriptions, and whether the direct management API and Git access are enabled. Also maps what each instance's managed identity can reach. |
 | `Check-KeyVaultAudit.ps1` | Standalone. Finds the vaults that APIM managed identities can read from, or can grant themselves access to. Checks whether audit logging is enabled, and queries Log Analytics for identity activity and new callers in a time window. |
+| `Analyze-Findings.ps1` | Follow-up analysis of the two scripts' output. Classifies the secrets held by APIM and flags environment mixing, reused secret names, all-access subscriptions, leftover logger credentials and literal backend credentials. Resolves flagged Key Vault callers in Entra ID, drills into their log history and gives each a heuristic verdict. Writes a Markdown report and can compare with a previous run. |
 | `docs/response-checklist.md` | Generic checklist for persistence checks, rotation and reporting steps. Not legal advice. |
 | `docs/DEVLOG.md` | What changed in the scripts and why, plus open ideas. |
 
@@ -30,8 +31,9 @@ Because the exact reach of the issue is not fully documented, these tools also l
 - Azure CLI (`az`), signed in with `az login`
 - **Reader** on the subscriptions you want to cover
 - For the audit script: **Log Analytics Reader** on the workspaces that hold Key Vault logs
+- For the follow-up analysis: also directory read access in Entra ID, to resolve object IDs
 
-Neither script changes anything in Azure. Both only read.
+None of the scripts changes anything in Azure. They only read.
 
 ## Usage
 
@@ -44,9 +46,45 @@ pwsh ./Check-ApimExposure.ps1
 # 2. Review Key Vault audit logs for the incident window
 pwsh ./Check-KeyVaultAudit.ps1
 # optional: -WindowStart 2026-11-16 -WindowEnd 2026-11-21 -LookbackDays 90
+
+# 3. Follow-up analysis of both outputs (same window as step 2)
+pwsh ./Analyze-Findings.ps1
+# later runs: compare with the previous result
+pwsh ./Analyze-Findings.ps1 -OutDir ./incident-analysis-2 -CompareTo ./incident-analysis
 ```
 
-Output goes to `./apim-exposure/` and `./kv-audit/` as CSV files. These contain real resource names, IDs and IP addresses. **Do not commit them** (they are listed in `.gitignore`).
+Output goes to `./apim-exposure/`, `./kv-audit/` and `./incident-analysis/`. It contains real resource names, IDs, identities and IP addresses. **Do not commit it.** The folders, and report formats such as `.docx` and `.pdf`, are listed in `.gitignore`.
+
+### Reading the follow-up analysis
+
+`analysis-report.md` summarises everything. The CSVs next to it hold the details:
+- `flags.csv`
+- `named-value-categories.csv`
+- `subscription-scopes.csv`
+- `backend-credentials.csv`
+- `logger-credentials.csv`
+- `caller-drilldown.csv`
+- `caller-ip-history.csv`
+- `caller-clients.csv`
+- `flagged-ip-other-callers.csv`
+
+**Caller verdicts.** Each caller the audit script flagged is checked against its own history in the logs:
+
+| Verdict | When |
+|---|---|
+| `SUSPICIOUS` | An APIM managed identity was used from an unexpected IP, or the identity can't be found in the directory. |
+| `INVESTIGATE` | The identity was never seen before the window, its in-window requests failed, it used a client not seen before, or its volume was more than three times its own baseline. |
+| `LIKELY CI/CD` | A known service principal or managed identity with a known client, calling from an Azure address or with an automation client such as Terraform. |
+| `LIKELY BENIGN` | A known identity and client calling from a new IP. |
+
+These are indicators, not proof. A stolen credential used with the same tool would look the same, so confirm every case with the owner, the sign-in logs or the pipeline history.
+
+**Other heuristics.**
+- **Environment** is inferred from names. Names without a `test`/`dev`/`prod` style marker are assumed to be production.
+- **Secret types** are inferred from display names.
+- **Backends** are checked for credential structure only. Values are never read or written out.
+
+**Comparing runs.** `-CompareTo` lists what changed since the earlier run's `snapshot.json`: instance status, vault verdicts, caller verdicts, flags and totals. Compare runs made in the same mode. A `-SkipLive` run has no backend, logger or caller data, so those show up as changes.
 
 ### Reading the first script's output
 

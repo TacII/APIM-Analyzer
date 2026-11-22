@@ -2,6 +2,31 @@
 
 Development notes for the scripts. Newest entries first. This log records what changed in the code and why. It never contains data or findings from any environment the scripts were run against.
 
+## 2026-11-22: Follow-up analysis script (`Analyze-Findings.ps1`)
+
+This automates the manual follow-up that was needed after a real run. It reads the output of the two scripts and makes read-only calls to Entra ID, Log Analytics and Resource Manager.
+
+- **Secrets held by APIM:**
+  - classifies each secret by type from its display name;
+  - flags the same secret name on production and non-production instances, production-looking keys on non-production instances, non-production keys on production instances, and plain values with secret-like names.
+- **Subscriptions:** the built-in all-access subscription (scope `/`) and "All APIs" subscriptions.
+- **Live checks:**
+  - backend credential structure, counting literal values versus named-value references without ever reading values;
+  - logger credentials that no logger references, using the `{{Logger-Credentials-…}}` references in each logger.
+- **Flagged Key Vault callers:**
+  - resolves each identity through Graph `directoryObjects/getByIds`;
+  - then, per caller and vault, collects all IPs over the log period, clients before and in the window, volume per day against the caller's own baseline, distinct items, and failed operations, ignoring routine `CertificateContactsGet` 403s;
+  - checks whether the flagged IP is in the `AzureCloud` service tag, which comes from the Resource Manager `serviceTags` API, so no internet download is needed;
+  - gives each caller a heuristic verdict.
+- **Report and comparison:** writes `analysis-report.md` and `snapshot.json`. `-CompareTo` lists the changes against an earlier snapshot, and `-SkipLive` works from the CSVs alone.
+
+What we learned while building it:
+- **Pairs, not identities.** The audit script's "new caller" is new per identity *and* IP pair. On a real run, every flagged caller turned out to be a long-known identity with the same client on a new IP. The drill-down makes that visible instead of leaving it to manual queries.
+- **All-access subscriptions.** Not every instance has an active built-in all-access subscription, so count them per instance rather than assuming one each.
+- **PowerShell pitfalls:**
+  - `0xFFFFFFFF` is an int32 (-1), so use `4294967295` for 32-bit masks.
+  - `,` binds tighter than `+`, so string concatenation inside `@(a + b, c + d)` needs parentheses.
+
 ## 2026-11-22: Fewer false alarms in the audit script
 
 What we learned from a real run:
@@ -53,8 +78,8 @@ Both scripts:
 
 ## Open ideas
 
-- **Backend credentials:** inspect them in the script. It could report credentials that are typed in directly rather than referenced from a named value, without ever printing values.
-- **Leftover logger credentials:** detect `Logger-Credentials-…` named values that no logger references.
-- **Mixed environments:** flag named values on non-production instances whose names suggest production keys (no `test`/`dev` suffix), and the reverse.
+- ~~Backend credentials, leftover logger credentials, mixed environments~~: done in `Analyze-Findings.ps1`.
 - **Group membership:** role assignments made through groups are not detected yet.
+- **Shared secret values:** compare secret values across environments by hash only, so reuse can be confirmed without exposing values. This would need a deliberate opt-in, since it reads secret values.
+- **Entra sign-in logs:** add an optional check of the flagged callers' sign-ins (IP, client app, location) when the account can read them.
 - **Other platforms:** test on Linux and macOS.
