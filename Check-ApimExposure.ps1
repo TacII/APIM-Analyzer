@@ -128,6 +128,13 @@ function Get-ScopeDecision($Instance, $Listed, [switch]$IncludeConsumption) {
 
 # Status for an in-scope instance. A v2-tier instance is never rated LIKELY EXPOSED (it is only in scope when
 # Microsoft lists it, i.e. it was Classic during the incident and has been migrated since).
+# Console label: the status plus tier family and platform, e.g. "LIKELY EXPOSED [Classic, stv2.1]", so that a
+# Classic instance on platform stv2.1 cannot be mistaken for a v2-tier instance.
+function Get-StatusLabel([string]$Status, [string]$TierFamily, [string]$PlatformVersion) {
+    $parts = @(@($TierFamily, $PlatformVersion) | Where-Object { $_ })
+    if ($parts.Count) { return "$Status [$($parts -join ', ')]" }
+    return $Status
+}
 function Get-InstanceStatus([switch]$Unchecked, [string]$TierFamily, [switch]$NoNetwork, [switch]$SecretsHeld) {
     if ($Unchecked) { return 'UNCHECKED' }
     if ($TierFamily -eq 'v2') { return 'REVIEW (v2 tier)' }
@@ -178,7 +185,7 @@ $inScopeIds = @($scope | Where-Object inScope | ForEach-Object { $_.id })
 $classic = @($apim | Where-Object { $_.id -in $inScopeIds })
 $outOfScope = @($scope | Where-Object { -not $_.inScope })
 Write-Host "Scope: $scopeSource"
-if (-not $listed) { Write-Host 'Note: stv2/stv2.1 (platformVersion) is the compute platform of the Classic tiers, not the v2 tiers (BasicV2/StandardV2/PremiumV2).' -ForegroundColor DarkGray }
+Write-Host 'Note: stv2/stv2.1 (platformVersion) is the compute platform of the Classic tiers, not the v2 tiers (BasicV2/StandardV2/PremiumV2).' -ForegroundColor DarkGray
 Write-Host "APIM instances: $($apim.Count) total, $($classic.Count) in scope, $($outOfScope.Count) out of scope"
 $scope | Where-Object inScope | Format-Table name, subscriptionId, sku, tierFamily, platformVersion, reason -AutoSize
 if ($outOfScope.Count) { $outOfScope | Format-Table name, sku, tierFamily, platformVersion, reason -AutoSize }
@@ -380,8 +387,8 @@ $summary = foreach ($i in $classic) {
         tierFamily = $sc.tierFamily; platformVersion = $i.platformVersion; scope = $sc.reason
     }
     $color = switch ($status) { 'UNCHECKED' { 'Red' } 'LIKELY EXPOSED' { 'Yellow' } default { 'Gray' } }
-    Write-Host ("{0,-15} {1} [{2}] {3} | vnet={4} public={5} PE={6} | secrets in APIM: {7}, in Key Vault: {8}, logger creds: {9}, certs in APIM: {10}, client-secret objects: {11} | active subscriptions: {12} | direct mgmt API: {13}, git: {14} | identity: {15}" -f `
-        $row.status, $row.apim, $row.subscriptionId, $row.sku, $row.vnetType, $row.publicAccess, $row.privateEndpoints,
+    Write-Host ("{0,-38} {1} [{2}] {3} | vnet={4} public={5} PE={6} | secrets in APIM: {7}, in Key Vault: {8}, logger creds: {9}, certs in APIM: {10}, client-secret objects: {11} | active subscriptions: {12} | direct mgmt API: {13}, git: {14} | identity: {15}" -f `
+        (Get-StatusLabel $row.status $sc.tierFamily $i.platformVersion), $row.apim, $row.subscriptionId, $row.sku, $row.vnetType, $row.publicAccess, $row.privateEndpoints,
         $row.secretsInApim, $row.secretsInKeyVault, $row.loggerCredentials, $row.certsInApim, $row.clientSecretObjects, $row.activeSubscriptions,
         $row.directMgmtApi, $row.gitAccess, $row.hasManagedIdentity) -ForegroundColor $color
     $row
@@ -396,7 +403,7 @@ $summary = @($summary) + @(foreach ($o in $outOfScope) {
         directMgmtApi = ''; gitAccess = ''; hasManagedIdentity = ''; tierFamily = $o.tierFamily; platformVersion = $o.platformVersion; scope = $o.reason
     }
 })
-foreach ($o in $outOfScope) { Write-Host ("{0,-15} {1} {2} ({3})" -f 'OUT OF SCOPE', $o.name, $o.sku, $o.reason) -ForegroundColor DarkGray }
+foreach ($o in $outOfScope) { Write-Host ("{0,-38} {1} {2} ({3})" -f (Get-StatusLabel 'OUT OF SCOPE' $o.tierFamily $o.platformVersion), $o.name, $o.sku, $o.reason) -ForegroundColor DarkGray }
 $summary | Export-Csv "$out\summary.csv"
 Write-Host @"
 Legend: LIKELY EXPOSED = no VNet/private endpoint and/or secrets held by APIM (matches Microsoft's conditions). Secrets held
