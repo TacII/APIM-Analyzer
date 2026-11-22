@@ -1,6 +1,7 @@
 # Script output contains real resource names, IDs and IP addresses. Never commit it.
 apim-exposure/
 kv-audit/
+incident-analysis/
 *.csv
 *.json
 # Archives and spreadsheets of the output (e.g. zipped results to send to someone)
