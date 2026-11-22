@@ -19,36 +19,51 @@ param(
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
-function Get-Json([string]$Method, [string]$Url, [string]$BodyFile) {
-    $azArgs = @('rest', '--method', $Method, '--url', $Url, '-o', 'json')
-    if ($BodyFile) { $azArgs += @('--body', "@$BodyFile", '--headers', 'Content-Type=application/json') }
-    $raw = & az @azArgs 2>&1
-    if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ _error = (($raw | Out-String).Trim()) } }
-    return ($raw | ConvertFrom-Json)
+# ARM calls go straight to the REST API with a token from az, not through `az rest`. On Windows az is az.cmd,
+# which runs via cmd.exe and mangles URLs containing '&' or '%'.
+$script:armToken = $null
+function Get-ArmToken {
+    if (-not $script:armToken -or $script:armToken.expires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
+        $t = az account get-access-token --resource 'https://management.azure.com/' -o json | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0 -or -not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
+        $exp = if ($t.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$t.expires_on) } else { [DateTimeOffset]::new([datetime]$t.expiresOn) }
+        $script:armToken = @{ value = $t.accessToken; expires = $exp }
+    }
+    return $script:armToken.value
+}
+# Returns the parsed response, or an object with _error. Retries throttling (429) and server errors a few times.
+function Get-Json([string]$Method, [string]$Url, $Body) {
+    for ($try = 1; ; $try++) {
+        $p = @{ Method = $Method; Uri = $Url; Headers = @{ Authorization = "Bearer $(Get-ArmToken)" } }
+        if ($null -ne $Body) { $p.Body = ($Body | ConvertTo-Json -Depth 10 -Compress); $p.ContentType = 'application/json' }
+        try { return (Invoke-RestMethod @p) }
+        catch {
+            $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($try -lt 4 -and ($code -eq 429 -or $code -ge 500)) { Start-Sleep -Seconds ([Math]::Pow(2, $try)); continue }
+            $msg = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+            return [pscustomobject]@{ _error = "HTTP $code $msg" }
+        }
+    }
 }
 
 # Resource Graph through its REST API rather than `az graph query`: this pages through all results and
 # accepts authorizationScopeFilter, which is needed to see role assignments inherited from management groups.
 function Invoke-Graph([string]$Query, [string[]]$Subs, [string]$ScopeFilter) {
-    $tmp = New-TemporaryFile
-    try {
-        for ($c = 0; $c -lt $Subs.Count; $c += 1000) {
-            $chunk = @($Subs[$c..([Math]::Min($c + 999, $Subs.Count - 1))])
-            $got = 0; $skip = $null
-            do {
-                $opts = [ordered]@{ '$top' = 1000; resultFormat = 'objectArray' }
-                if ($skip) { $opts['$skipToken'] = $skip }
-                if ($ScopeFilter) { $opts['authorizationScopeFilter'] = $ScopeFilter }
-                @{ subscriptions = $chunk; query = $Query; options = $opts } | ConvertTo-Json -Depth 5 -Compress |
-                    Set-Content $tmp -Encoding utf8
-                $r = Get-Json POST 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-06-01-preview' $tmp.FullName
-                if ($r._error) { throw "Resource Graph query failed: $($r._error)" }
-                foreach ($d in @($r.data)) { $got++; $d }
-                $skip = $r.'$skipToken'
-            } while ($skip)
-            if ($r.totalRecords -gt $got) { throw "Result truncated ($got of $($r.totalRecords))." }
-        }
-    } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+    for ($c = 0; $c -lt $Subs.Count; $c += 1000) {
+        $chunk = @($Subs[$c..([Math]::Min($c + 999, $Subs.Count - 1))])
+        $got = 0; $skip = $null
+        do {
+            $opts = [ordered]@{ '$top' = 1000; resultFormat = 'objectArray' }
+            if ($skip) { $opts['$skipToken'] = $skip }
+            if ($ScopeFilter) { $opts['authorizationScopeFilter'] = $ScopeFilter }
+            $r = Get-Json POST 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-06-01-preview' `
+                @{ subscriptions = $chunk; query = $Query; options = $opts }
+            if ($r._error) { throw "Resource Graph query failed: $($r._error)" }
+            foreach ($d in @($r.data)) { $got++; $d }
+            $skip = $r.'$skipToken'
+        } while ($skip)
+        if ($r.totalRecords -gt $got) { throw "Result truncated ($got of $($r.totalRecords))." }
+    }
 }
 
 function Expand-Json($v) {
@@ -211,11 +226,7 @@ $logging | Export-Csv "$OutDir\vault-logging.csv"
 
 # ---- 4. Query the logs --------------------------------------------------------------------------
 function Invoke-La([string]$ws, [string]$kql) {
-    $tmp = New-TemporaryFile
-    try {
-        @{ query = $kql; timespan = "P$($LookbackDays)D" } | ConvertTo-Json -Compress | Set-Content $tmp -Encoding utf8
-        $r = Get-Json POST "https://management.azure.com$ws/api/query?api-version=2017-01-01-preview" $tmp.FullName
-    } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+    $r = Get-Json POST "https://management.azure.com$ws/api/query?api-version=2017-01-01-preview" @{ query = $kql; timespan = "P$($LookbackDays)D" }
     if ($r._error) { throw $r._error }
     $t = $r.tables[0]
     # This endpoint returns Columns[].ColumnName; the newer API returns columns[].name. Accept both.

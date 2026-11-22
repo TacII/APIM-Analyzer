@@ -52,8 +52,10 @@ Output goes to `./apim-exposure/` and `./kv-audit/` as CSV files. These contain 
 1. Check the preflight line first. `Preflight clean` means every subscription was readable and the direct and Resource Graph counts agree. Any warning means those subscriptions were not properly checked.
 2. The per-instance summary uses these statuses: `LIKELY EXPOSED`, `REVIEW` and `UNCHECKED`. There is deliberately no "safe" status, because the script cannot prove that nothing was accessed.
    - `LIKELY EXPOSED` means there is no VNet or private endpoint, or APIM holds secrets itself. That covers secret named values not in Key Vault, certificates uploaded directly, and identity provider, OpenID Connect or authorization server configurations, which may carry client secrets.
-   - `UNCHECKED` means named values, certificates or those client-secret objects could not be listed.
-3. `activeSubscriptions`, `directMgmtApi` and `gitAccess` are there for rotation planning and do not change the status. Every active APIM subscription has keys held in APIM. If `directMgmtApi` is `True`, management tokens could have been issued. Subscription metadata goes to `apim-subscriptions.csv`. The keys themselves are never read.
+   - `UNCHECKED` means named values, certificates or those client-secret objects could not be listed. Object kinds that the pricing tier doesn't support, such as identity providers on Consumption, are not counted as failures.
+   - `loggerCredentials` counts the `Logger-Credentials-…` named values that APIM creates for Application Insights loggers. They are shown separately from `secretsInApim` and don't affect the status. Repeated deployments can leave many of them behind.
+3. `activeSubscriptions`, `directMgmtApi` and `gitAccess` are there for rotation planning and do not change the status. Every active APIM subscription has keys held in APIM. If `directMgmtApi` is `True`, management tokens could have been issued. `gitAccess` is often `True` without anyone having turned it on, and its keys exist either way. Subscription metadata goes to `apim-subscriptions.csv`. The keys themselves are never read.
+4. Backends are listed in `other-secret-objects.csv` but their credentials (basic-auth headers, client certificates) are not inspected. Review them by hand.
 
 ### Reading the second script's output
 
@@ -78,6 +80,7 @@ Output goes to `./apim-exposure/` and `./kv-audit/` as CSV files. These contain 
 - Log queries read both the `AzureDiagnostics` and the resource-specific `AZKVAuditLogs` schema. The `AZKVAuditLogs` column names were checked against Microsoft's table reference. The object-ID claim layout was not verified in every workspace.
 - Access through any unlogged path will not appear in Key Vault's logs.
 - Written and tested on Windows with PowerShell 7. Behaviour elsewhere is unknown.
+- Azure Resource Manager is called directly with a token from `az account get-access-token`, not through `az rest`. On Windows, `az` is a batch file that cuts URLs at `&`, which broke paging in earlier versions.
 
 ## Contributing
 

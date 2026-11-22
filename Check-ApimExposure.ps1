@@ -12,30 +12,52 @@ $ErrorActionPreference = 'Stop'
 $out = Join-Path $PWD 'apim-exposure'
 New-Item -ItemType Directory -Force $out | Out-Null
 
+# ARM calls go straight to the REST API with a token from az, not through `az rest`. On Windows az is az.cmd,
+# which runs via cmd.exe and cuts URLs at '&' - so every nextLink (…&$skip=100) silently returned page 1 again.
+$script:armToken = $null
+function Get-ArmToken {
+    if (-not $script:armToken -or $script:armToken.expires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
+        $t = az account get-access-token --resource 'https://management.azure.com/' -o json | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0 -or -not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
+        $exp = if ($t.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$t.expires_on) } else { [DateTimeOffset]::new([datetime]$t.expiresOn) }
+        $script:armToken = @{ value = $t.accessToken; expires = $exp }
+    }
+    return $script:armToken.value
+}
+# Returns @{ ok; data } or @{ ok = $false; error }. Retries throttling (429) and server errors a few times.
+function Invoke-Arm([string]$Method, [string]$Url, $Body) {
+    for ($try = 1; ; $try++) {
+        $p = @{ Method = $Method; Uri = $Url; Headers = @{ Authorization = "Bearer $(Get-ArmToken)" } }
+        if ($null -ne $Body) { $p.Body = ($Body | ConvertTo-Json -Depth 10 -Compress); $p.ContentType = 'application/json' }
+        try { return [pscustomobject]@{ ok = $true; data = (Invoke-RestMethod @p) } }
+        catch {
+            $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($try -lt 4 -and ($code -eq 429 -or $code -ge 500)) { Start-Sleep -Seconds ([Math]::Pow(2, $try)); continue }
+            $msg = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+            return [pscustomobject]@{ ok = $false; error = "HTTP $code $msg" }
+        }
+    }
+}
+
 # Resource Graph through its REST API rather than `az graph query`: this pages through all results and
 # accepts authorizationScopeFilter, which is needed to see role assignments inherited from management groups.
 function Invoke-Graph([string]$Query, [string[]]$Subs, [string]$ScopeFilter) {
-    $tmp = New-TemporaryFile
-    try {
-        for ($c = 0; $c -lt $Subs.Count; $c += 1000) {
-            $chunk = @($Subs[$c..([Math]::Min($c + 999, $Subs.Count - 1))])
-            $got = 0; $skip = $null
-            do {
-                $opts = [ordered]@{ '$top' = 1000; resultFormat = 'objectArray' }
-                if ($skip) { $opts['$skipToken'] = $skip }
-                if ($ScopeFilter) { $opts['authorizationScopeFilter'] = $ScopeFilter }
-                @{ subscriptions = $chunk; query = $Query; options = $opts } | ConvertTo-Json -Depth 5 -Compress |
-                    Set-Content $tmp -Encoding utf8
-                $raw = az rest --method post --url 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-06-01-preview' `
-                    --body "@$($tmp.FullName)" --headers 'Content-Type=application/json' -o json 2>&1
-                if ($LASTEXITCODE -ne 0) { throw "Resource Graph query failed: $(($raw | Out-String).Trim())" }
-                $r = $raw | ConvertFrom-Json
-                foreach ($d in @($r.data)) { $got++; $d }
-                $skip = $r.'$skipToken'
-            } while ($skip)
-            if ($r.totalRecords -gt $got) { throw "Result truncated ($got of $($r.totalRecords)) - the query is not being applied as intended." }
-        }
-    } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+    for ($c = 0; $c -lt $Subs.Count; $c += 1000) {
+        $chunk = @($Subs[$c..([Math]::Min($c + 999, $Subs.Count - 1))])
+        $got = 0; $skip = $null
+        do {
+            $opts = [ordered]@{ '$top' = 1000; resultFormat = 'objectArray' }
+            if ($skip) { $opts['$skipToken'] = $skip }
+            if ($ScopeFilter) { $opts['authorizationScopeFilter'] = $ScopeFilter }
+            $res = Invoke-Arm POST 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-06-01-preview' `
+                @{ subscriptions = $chunk; query = $Query; options = $opts }
+            if (-not $res.ok) { throw "Resource Graph query failed: $($res.error)" }
+            $r = $res.data
+            foreach ($d in @($r.data)) { $got++; $d }
+            $skip = $r.'$skipToken'
+        } while ($skip)
+        if ($r.totalRecords -gt $got) { throw "Result truncated ($got of $($r.totalRecords)) - the query is not being applied as intended." }
+    }
 }
 
 $subs = @(az account list --query "[?state=='Enabled'].id" -o tsv)
@@ -65,15 +87,19 @@ $classic | Format-Table name, subscriptionId, sku, vnetType, publicAccess, priva
 $n = 0
 $pre = foreach ($s in $subs) {
     $n++; Write-Host "Preflight $n/$($subs.Count): $s"
-    $raw = az rest --method get --url "https://management.azure.com/subscriptions/$s/providers/Microsoft.ApiManagement/service?api-version=2024-05-01" -o json 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $direct = @(($raw | ConvertFrom-Json).value).Count
+    $direct = 0; $err = $null
+    $url = "https://management.azure.com/subscriptions/$s/providers/Microsoft.ApiManagement/service?api-version=2024-05-01"
+    while ($url -and -not $err) {
+        $res = Invoke-Arm GET $url
+        if ($res.ok) { $direct += @($res.data.value).Count; $url = $res.data.nextLink } else { $err = $res.error }
+    }
+    if (-not $err) {
         $viaGraph = @($apim | Where-Object { $_.subscriptionId -eq $s }).Count
         [pscustomobject]@{ subscriptionId = $s; access = 'OK'; apimDirect = $direct; apimViaGraph = $viaGraph
                            mismatch = ($direct -ne $viaGraph); detail = '' }
     } else {
         [pscustomobject]@{ subscriptionId = $s; access = 'DENIED/ERROR'; apimDirect = $null; apimViaGraph = $null
-                           mismatch = $true; detail = (($raw | Out-String).Trim() -split "`n")[0] }
+                           mismatch = $true; detail = ($err -split "`n")[0] }
     }
 }
 $pre | Export-Csv "$out\subscription-access.csv"
@@ -86,26 +112,28 @@ if (-not $bad.Count -and -not $mm.Count) { Write-Host 'Preflight clean: every su
 
 # 2. Named values and other secret-bearing objects on Classic instances
 $script:failures = @()
+# A pricing tier that does not support an object kind (e.g. identity providers on Consumption) is not a failure:
+# there is nothing of that kind to expose.
+function Test-NotInTier([string]$Err) { return $Err -match 'MethodNotAllowedInPricingTier' }
 function Get-Paged([string]$Url) {
     $orig = $Url
     while ($Url) {
-        $raw = az rest --method get --url $Url -o json 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            $script:failures += [pscustomobject]@{ url = $orig; error = ($raw | Out-String).Trim() }
+        $res = Invoke-Arm GET $Url
+        if (-not $res.ok) {
+            if (-not (Test-NotInTier $res.error)) { $script:failures += [pscustomobject]@{ url = $orig; error = $res.error } }
             return
         }
-        $r = $raw | ConvertFrom-Json
-        $r.value
-        $Url = $r.nextLink
+        $res.data.value
+        $Url = $res.data.nextLink
     }
 }
 function Get-One([string]$Url) {
-    $raw = az rest --method get --url $Url -o json 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $script:failures += [pscustomobject]@{ url = $Url; error = ($raw | Out-String).Trim() }
+    $res = Invoke-Arm GET $Url
+    if (-not $res.ok) {
+        if (-not (Test-NotInTier $res.error)) { $script:failures += [pscustomobject]@{ url = $Url; error = $res.error } }
         return $null
     }
-    return ($raw | ConvertFrom-Json)
+    return $res.data
 }
 # Principal IDs (lower-case) of the instance's managed identities. An identity block of type 'None' has none.
 function Get-PrincipalIds($Identity) {
@@ -126,9 +154,12 @@ foreach ($i in $classic) {
     Write-Host "Inspecting $($i.name)"
     try {
         foreach ($v in Get-Paged "$base$($i.id)/namedValues?$api") {
+            # 'Logger-Credentials-…' named values are created by APIM for Application Insights loggers (instrumentation
+            # key / connection string). They are kept apart from other secrets: low impact, but often left behind in bulk.
             $nvRows += [pscustomobject]@{
-                apim = $i.name; subscriptionId = $i.subscriptionId; namedValue = $v.name
+                apim = $i.name; subscriptionId = $i.subscriptionId; namedValue = $v.name; displayName = $v.properties.displayName
                 secret = $v.properties.secret; inKeyVault = [bool]$v.properties.keyVault
+                loggerCredential = ("$($v.properties.displayName)" -like 'Logger-Credentials*')
             }
         }
         foreach ($kind in 'identityProviders','openidConnectProviders','authorizationServers','backends','loggers','authorizationProviders') {
@@ -175,8 +206,9 @@ if ($script:failures.Count) {
 $nvRows | Export-Csv "$out\named-values.csv"
 $otherRows | Export-Csv "$out\other-secret-objects.csv"
 $subRows | Export-Csv "$out\apim-subscriptions.csv"
-$exposed = @($nvRows | Where-Object { $_.secret -and -not $_.inKeyVault })
-Write-Host "Secret named values stored in APIM (not Key Vault): $($exposed.Count)"
+$exposed = @($nvRows | Where-Object { $_.secret -and -not $_.inKeyVault -and -not $_.loggerCredential })
+$loggerCreds = @($nvRows | Where-Object { $_.secret -and -not $_.inKeyVault -and $_.loggerCredential })
+Write-Host "Secret named values stored in APIM (not Key Vault): $($exposed.Count), plus $($loggerCreds.Count) logger credentials"
 Write-Host "Certificates stored in APIM (not Key Vault): $(@($otherRows | Where-Object { $_.kind -eq 'certificates' -and $_.storedIn -eq 'APIM' }).Count)"
 
 # 3. What can the APIM managed identities reach? (RBAC assignments + Key Vault access policies)
@@ -210,7 +242,8 @@ Write-Host "`n=== Per-instance summary (Classic tier only) ==="
 $summary = foreach ($i in $classic) {
     $mine = @($nvRows | Where-Object { $_.apim -eq $i.name -and $_.subscriptionId -eq $i.subscriptionId })
     $mineOther = @($otherRows | Where-Object { $_.apim -eq $i.name -and $_.subscriptionId -eq $i.subscriptionId })
-    $inApim = @($mine | Where-Object { $_.secret -and -not $_.inKeyVault }).Count
+    $inApim = @($mine | Where-Object { $_.secret -and -not $_.inKeyVault -and -not $_.loggerCredential }).Count
+    $loggerInApim = @($mine | Where-Object { $_.secret -and -not $_.inKeyVault -and $_.loggerCredential }).Count
     $inKv = @($mine | Where-Object { $_.inKeyVault }).Count
     $certsInApim = @($mineOther | Where-Object { $_.kind -eq 'certificates' -and $_.storedIn -eq 'APIM' }).Count
     $clientSecretObjs = @($mineOther | Where-Object { $_.kind -in 'identityProviders','openidConnectProviders','authorizationServers' }).Count
@@ -230,6 +263,7 @@ $summary = foreach ($i in $classic) {
         status = $status; apim = $i.name; subscriptionId = $i.subscriptionId; sku = $i.sku
         vnetType = $i.vnetType; publicAccess = $i.publicAccess; privateEndpoints = $pe
         secretsInApim = if ($nvFailed) { 'n/a' } else { $inApim }; secretsInKeyVault = if ($nvFailed) { 'n/a' } else { $inKv }
+        loggerCredentials = if ($nvFailed) { 'n/a' } else { $loggerInApim }
         certsInApim = if ($otherFailed) { 'n/a' } else { $certsInApim }
         clientSecretObjects = if ($otherFailed) { 'n/a' } else { $clientSecretObjs }
         activeSubscriptions = if ('subscriptions' -in $failedKinds) { 'n/a' } else { $activeSubs }
@@ -238,9 +272,9 @@ $summary = foreach ($i in $classic) {
         hasManagedIdentity = (@($instPrincipals[$i.id]).Count -gt 0)
     }
     $color = switch ($status) { 'UNCHECKED' { 'Red' } 'LIKELY EXPOSED' { 'Yellow' } default { 'Gray' } }
-    Write-Host ("{0,-15} {1} [{2}] {3} | vnet={4} public={5} PE={6} | secrets in APIM: {7}, in Key Vault: {8}, certs in APIM: {9}, client-secret objects: {10} | active subscriptions: {11} | direct mgmt API: {12}, git: {13} | identity: {14}" -f `
+    Write-Host ("{0,-15} {1} [{2}] {3} | vnet={4} public={5} PE={6} | secrets in APIM: {7}, in Key Vault: {8}, logger creds: {9}, certs in APIM: {10}, client-secret objects: {11} | active subscriptions: {12} | direct mgmt API: {13}, git: {14} | identity: {15}" -f `
         $row.status, $row.apim, $row.subscriptionId, $row.sku, $row.vnetType, $row.publicAccess, $row.privateEndpoints,
-        $row.secretsInApim, $row.secretsInKeyVault, $row.certsInApim, $row.clientSecretObjects, $row.activeSubscriptions,
+        $row.secretsInApim, $row.secretsInKeyVault, $row.loggerCredentials, $row.certsInApim, $row.clientSecretObjects, $row.activeSubscriptions,
         $row.directMgmtApi, $row.gitAccess, $row.hasManagedIdentity) -ForegroundColor $color
     $row
 }
@@ -252,8 +286,11 @@ Legend: LIKELY EXPOSED = no VNet/private endpoint and/or secrets held by APIM (m
         REVIEW = looks network-integrated with no APIM-held secrets, but compare against Microsoft's
                  'Network security' requirements and check Key Vault access (the managed identity may still reach vaults).
         UNCHECKED = named values, certificates or client-secret objects could not be read (see failed-calls.csv).
+        Logger creds = Application Insights logger credentials APIM created itself; shown separately, not used in the status.
         Subscription keys exist on every instance with active subscriptions; direct mgmt API = True means management
         tokens could be issued. Both are listed for rotation planning, not used in the status.
+        Git access is often reported as enabled without anyone turning it on; its keys exist either way and can be
+        regenerated.
 "@
 
 Write-Host "Done. Output in $out"
