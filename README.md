@@ -67,7 +67,9 @@ Output goes to `./apim-exposure/` and `./kv-audit/` as CSV files. These contain 
   Assignments that give none of these, such as Reader, go to `excluded-role-assignments.csv`. Roles that cannot be resolved are counted as reachable.
 - Role assignments inherited from management groups and the tenant root are included.
 - `SUSPICIOUS - review` means an APIM identity was used from an address that is not one of the instance's own, or a caller and IP pair that was not seen before the window read secrets, keys or certificates. New pairs can be benign. Investigate before concluding anything.
-- `REVIEW` means there was APIM identity activity whose source IP cannot be checked. Either the instance has no static IP, or the log row has no caller IP. The script also warns when log rows lack a caller IP or object ID, which usually means the column mapping doesn't match that workspace.
+- `REVIEW` means there was APIM identity activity whose source IP cannot be checked. Either the instance has no static IP, or the log row has no caller IP.
+- The script warns when authenticated data-plane rows lack a caller IP or object ID, which usually means the column mapping doesn't match that workspace. 401 authentication challenges and control-plane operations such as `VaultGet` are left out, because they never carry an object ID.
+- The script warns when the logs start later than `-LookbackDays`, which usually means the workspace's retention is shorter. The warning also says roughly when the window's first day will age out. `baselineDays` in `vault-verdicts.csv` shows how much history came before the window. With a short baseline, ordinary callers often show up as new, such as CI agents on changing IPs or admins on another network. Check the client and the caller's history before treating one as suspicious.
 - `NO AUDIT LOGGING`, `NO LOG DATA` and `PARTIAL COVERAGE` mean there is no evidence either way. Treat those vaults as potentially accessed.
 - `no anomaly found in available logs` only covers the period and data that were actually logged.
 

@@ -2,6 +2,14 @@
 
 Development notes for the scripts. Newest entries first. This log records what changed in the code and why. It never contains data or findings from any environment the scripts were run against.
 
+## 2026-11-22: Fewer false alarms in the audit script
+
+What we learned from a real run:
+- **The missing-object-ID warning was mostly noise.** Key Vault logs a 401 `Authentication` challenge before most authenticated calls, and control-plane operations (`VaultGet`, `AccessPolicy*`) never carry an object ID. Those rows made up roughly a third of all events. The check now counts only authenticated data-plane calls (`Secret*`, `Key*`, `Certificate*` without a 401). `Http` was added to the normalised schema for this.
+- **Short retention made ordinary callers look new.** With a 90-day lookback but a workspace that keeps 30 days, the baseline before the window was only about three weeks. The script now warns when the logs start later than the lookback, and says roughly when the window's first day will age out. `vault-verdicts.csv` gains a `baselineDays` column.
+- **Typical harmless "new callers"** were CI/CD agents, which use a new Azure IP on every run (Terraform's Go SDK, `CertificateContactsGet` 403s), and admins working from a new network with the same client string as always. The legend now says so.
+- `.gitignore` now also covers report formats (`*.docx`, `*.doc`, `*.pdf`, `*.pptx`). Reports written from the output contain the same tenant data and must stay outside the repo.
+
 ## 2026-11-22: Ignore archived output
 
 - `.gitignore` now also covers archives (`*.zip`, `*.7z`, `*.rar`, `*.tar`, `*.gz`) and spreadsheets (`*.xlsx`, `*.xls`). People often zip the output folders or open them in Excel to pass them on, and those copies contain the same tenant data as the CSVs.

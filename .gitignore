@@ -11,6 +11,11 @@ kv-audit/
 *.gz
 *.xlsx
 *.xls
+# Reports written from the output (they contain the same tenant data)
+*.docx
+*.doc
+*.pdf
+*.pptx
 
 # Local / editor files
 .vscode/
