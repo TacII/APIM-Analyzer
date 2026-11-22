@@ -8,6 +8,7 @@ Run `az login` first. Output goes to .\kv-audit\
 
 Author:  Mathias Haas, Fidelity Consulting AB
 Contact: bWF0aGlhcy5oYWFzQGZpZGVsaXR5Y29uc3VsdGluZy5zZQ== (base64)
+License: MIT (see LICENSE). Provided as is, without warranty.
 #>
 param(
     [string]$OutDir = (Join-Path $PWD 'kv-audit'),

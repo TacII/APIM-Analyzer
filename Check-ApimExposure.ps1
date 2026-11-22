@@ -6,6 +6,7 @@ Run `az login` first (az CLI).
 
 Author:  Mathias Haas, Fidelity Consulting AB
 Contact: bWF0aGlhcy5oYWFzQGZpZGVsaXR5Y29uc3VsdGluZy5zZQ== (base64)
+License: MIT (see LICENSE). Provided as is, without warranty.
 #>
 $ErrorActionPreference = 'Stop'
 $out = Join-Path $PWD 'apim-exposure'

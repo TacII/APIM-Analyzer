@@ -91,4 +91,4 @@ Contact (base64-encoded): `bWF0aGlhcy5oYWFzQGZpZGVsaXR5Y29uc3VsdGluZy5zZQ==`
 
 ## License
 
-No license has been chosen yet. Until one is added, all rights are reserved by the author.
+[MIT](LICENSE). The scripts are provided as is, without warranty of any kind. You are responsible for reviewing them and verifying their results before acting on them.
