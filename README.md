@@ -22,6 +22,7 @@ Because the exact reach of the issue is not fully documented, these tools also l
 | `Check-ApimExposure.ps1` | Finds APIM instances across all subscriptions you can read, flags Classic tiers, and checks network settings. Lists named values, certificates, identity providers and other secret-bearing objects, APIM subscriptions, and whether the direct management API and Git access are enabled. Also maps what each instance's managed identity can reach. |
 | `Check-KeyVaultAudit.ps1` | Standalone. Finds the vaults that APIM managed identities can read from, or can grant themselves access to. Checks whether audit logging is enabled, and queries Log Analytics for identity activity and new callers in a time window. |
 | `docs/response-checklist.md` | Generic checklist for persistence checks, rotation and reporting steps. Not legal advice. |
+| `docs/DEVLOG.md` | What changed in the scripts and why, plus open ideas. |
 
 ## Requirements
 
