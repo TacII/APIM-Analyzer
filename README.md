@@ -26,9 +26,15 @@ pwsh ./Check-ApimExposure.ps1 -ImpactedResourcesCsv ./impacted-resources.csv
 If your account may read the advisory's impacted resources through the API (Owner/Contributor, or a role with `Microsoft.ResourceHealth/events/fetchEventDetails/action`), the script fetches the list itself.
 
 Without that list, the script falls back to a rule: **Classic dedicated tiers** (Developer, Basic, Standard, Premium).
-- **v2 tiers** are never in scope.
+- **v2 tiers** (`BasicV2`, `StandardV2`, `PremiumV2`) are never in scope.
 - **Consumption** (multi-tenant platform `mtv1`) is out of scope by default. Microsoft's notice names it among the Classic tiers, but in the tenants checked so far Microsoft's impacted-resources list included only dedicated-tier instances. Add `-IncludeConsumption` to include it anyway.
-- **Platform version** (`stv1`/`stv2`) is shown but not used. Instances on `stv2.1` were listed as impacted.
+- **Platform version** is shown but not used. Instances on `stv2.1` were listed as impacted.
+
+> **stv2 is not v2.** `stv1`, `stv2` and `stv2.1` in `platformVersion` are the compute platforms of the **Classic** tiers. Nearly every Classic instance runs on stv2.x today. The **v2 tiers** are a separate product line, identified by the SKU. The `tierFamily` column (`Classic`, `Classic (Consumption)` or `v2`) in `scope.csv` and `summary.csv` shows which one an instance is.
+
+**Matching Microsoft's list.** Instances are matched on resource ID when the list has one (case-insensitive), and on name otherwise.
+
+**A v2 instance on Microsoft's list.** If Microsoft lists an instance that is now a v2 tier, it was probably migrated from Classic after the incident. It stays in scope, because its secrets may have been exposed while it was Classic, but it is rated `REVIEW (v2 tier)` and never `LIKELY EXPOSED`. The script prints a warning for it.
 
 The decision per instance is written to `apim-exposure/scope.csv`. The audit and analysis scripts use that file when it exists, so all three scripts work on the same set.
 
@@ -41,6 +47,7 @@ The decision per instance is written to `apim-exposure/scope.csv`. The audit and
 | `Analyze-Findings.ps1` | Follow-up analysis of the two scripts' output. Classifies the secrets held by APIM and flags environment mixing, reused secret names, all-access subscriptions, leftover logger credentials and literal backend credentials. Resolves flagged Key Vault callers in Entra ID, drills into their log history and gives each a heuristic verdict. Writes a Markdown report and can compare with a previous run. |
 | `docs/response-checklist.md` | Generic checklist for persistence checks, rotation and reporting steps. Not legal advice. |
 | `docs/DEVLOG.md` | What changed in the scripts and why, plus open ideas. |
+| `tests/Scope.Tests.ps1` | Offline Pester 5 tests for the scope and status decisions (`Invoke-Pester ./tests`). GitHub Actions runs them on every pull request. |
 
 ## Requirements
 
