@@ -2,6 +2,14 @@
 
 Development notes for the scripts. Newest entries first. This log records what changed in the code and why. It never contains data or findings from any environment the scripts were run against.
 
+## 2026-11-22: Tier family and platform next to every status
+
+The same user retested with v0.1.0 and still read `LIKELY EXPOSED` on stv2.1 instances as a problem. Those instances are Classic tiers, so the behaviour is correct, but the console output made the mix-up easy.
+
+- **Labelled statuses.** Each per-instance line now reads like `LIKELY EXPOSED [Classic, stv2.1]`, `REVIEW (v2 tier) [v2]` or `OUT OF SCOPE [Classic (Consumption), mtv1]`, built by `Get-StatusLabel`.
+- **The stv2 note always prints,** also when Microsoft's list is used, not only with the fallback rule.
+- **Tests.** New Pester cases cover the label, including the end-to-end case "Classic on stv2.1 reads as Classic".
+
 ## 2026-11-22: stv2 is not v2; v2 instances never rated LIKELY EXPOSED
 
 **Report:** a user saw instances on platform `stv2.1` rated `LIKELY EXPOSED` and read that as "v2 instances". `stv1`/`stv2`/`stv2.1` is the compute platform of the **Classic** tiers. The v2 tiers are the SKUs `BasicV2`, `StandardV2` and `PremiumV2`. The user couldn't read the advisory, so the tier rule applied, and their instances were Classic dedicated tiers: in scope by design. In the tenant we tested, every instance Microsoft listed was a Classic tier on stv2.1.

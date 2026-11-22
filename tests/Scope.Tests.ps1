@@ -10,7 +10,7 @@ Run:  Invoke-Pester ./tests
 BeforeAll {
     $scriptPath = Join-Path $PSScriptRoot '../Check-ApimExposure.ps1'
     $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $scriptPath), [ref]$null, [ref]$null)
-    $wanted = 'Get-ResourceName', 'Get-TierFamily', 'New-ImpactedList', 'Add-Impacted', 'Get-ScopeDecision', 'Get-InstanceStatus'
+    $wanted = 'Get-ResourceName', 'Get-TierFamily', 'New-ImpactedList', 'Add-Impacted', 'Get-ScopeDecision', 'Get-InstanceStatus', 'Get-StatusLabel'
     $defs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -in $wanted }, $true)
     foreach ($d in $defs) { . ([scriptblock]::Create($d.Extent.Text)) }
 
@@ -24,7 +24,7 @@ BeforeAll {
 
 Describe 'Function loading' {
     It 'finds every function under test in Check-ApimExposure.ps1' {
-        foreach ($n in 'Get-ResourceName', 'Get-TierFamily', 'New-ImpactedList', 'Add-Impacted', 'Get-ScopeDecision', 'Get-InstanceStatus') {
+        foreach ($n in 'Get-ResourceName', 'Get-TierFamily', 'New-ImpactedList', 'Add-Impacted', 'Get-ScopeDecision', 'Get-InstanceStatus', 'Get-StatusLabel') {
             Get-Command $n -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty -Because "$n must exist"
         }
     }
@@ -134,5 +134,21 @@ Describe 'Get-InstanceStatus' {
     }
     It 'reports UNCHECKED first when objects could not be read' {
         Get-InstanceStatus -Unchecked -TierFamily 'v2' -NoNetwork | Should -Be 'UNCHECKED'
+    }
+}
+
+Describe 'Get-StatusLabel' {
+    It 'shows tier family and platform: <Expected>' -TestCases @(
+        @{ Status = 'LIKELY EXPOSED'; Family = 'Classic'; Platform = 'stv2.1'; Expected = 'LIKELY EXPOSED [Classic, stv2.1]' }
+        @{ Status = 'REVIEW (v2 tier)'; Family = 'v2'; Platform = ''; Expected = 'REVIEW (v2 tier) [v2]' }
+        @{ Status = 'OUT OF SCOPE'; Family = 'Classic (Consumption)'; Platform = 'mtv1'; Expected = 'OUT OF SCOPE [Classic (Consumption), mtv1]' }
+        @{ Status = 'REVIEW'; Family = ''; Platform = ''; Expected = 'REVIEW' }
+    ) {
+        Get-StatusLabel $Status $Family $Platform | Should -Be $Expected
+    }
+    It 'makes a Classic instance on stv2.1 read as Classic, not v2' {
+        $d = Get-ScopeDecision (New-Instance 'apim-std' 'Standard' 'stv2.1') $null
+        $status = Get-InstanceStatus -TierFamily $d.tierFamily -NoNetwork
+        Get-StatusLabel $status $d.tierFamily 'stv2.1' | Should -Be 'LIKELY EXPOSED [Classic, stv2.1]'
     }
 }

@@ -30,7 +30,7 @@ Without that list, the script falls back to a rule: **Classic dedicated tiers** 
 - **Consumption** (multi-tenant platform `mtv1`) is out of scope by default. Microsoft's notice names it among the Classic tiers, but in the tenants checked so far Microsoft's impacted-resources list included only dedicated-tier instances. Add `-IncludeConsumption` to include it anyway.
 - **Platform version** is shown but not used. Instances on `stv2.1` were listed as impacted.
 
-> **stv2 is not v2.** `stv1`, `stv2` and `stv2.1` in `platformVersion` are the compute platforms of the **Classic** tiers. Nearly every Classic instance runs on stv2.x today. The **v2 tiers** are a separate product line, identified by the SKU. The `tierFamily` column (`Classic`, `Classic (Consumption)` or `v2`) in `scope.csv` and `summary.csv` shows which one an instance is.
+> **stv2 is not v2.** `stv1`, `stv2` and `stv2.1` in `platformVersion` are the compute platforms of the **Classic** tiers. Nearly every Classic instance runs on stv2.x today. The **v2 tiers** are a separate product line, identified by the SKU. The `tierFamily` column (`Classic`, `Classic (Consumption)` or `v2`) in `scope.csv` and `summary.csv` shows which one an instance is. The console shows it next to each status, for example `LIKELY EXPOSED [Classic, stv2.1]`.
 
 **Matching Microsoft's list.** Instances are matched on resource ID when the list has one (case-insensitive), and on name otherwise.
 
