@@ -4,10 +4,22 @@ Checks every enabled subscription you can see for Azure API Management Classic i
 and writes CSVs to .\apim-exposure\ . Read-only. Needs Reader on the subscriptions.
 Run `az login` first (az CLI).
 
+Which instances are in scope:
+  1. Microsoft's own list of impacted resources, when available - from -ImpactedResourcesCsv (Service Health >
+     Security advisories > the advisory > Impacted Resources > Export to CSV), or read from the Service Health
+     API if your account may (Owner/Contributor or a role with Microsoft.ResourceHealth/events/fetchEventDetails/action).
+  2. Otherwise: Classic dedicated tiers (Developer, Basic, Standard, Premium). v2 tiers are not affected, and
+     Consumption instances were not listed by Microsoft in the tenants checked so far; add -IncludeConsumption
+     to include them anyway.
+
 Author:  Mathias Haas, Fidelity Consulting AB
 Contact: bWF0aGlhcy5oYWFzQGZpZGVsaXR5Y29uc3VsdGluZy5zZQ== (base64)
 License: MIT (see LICENSE). Provided as is, without warranty.
 #>
+param(
+    [string]$ImpactedResourcesCsv,   # export of Microsoft's impacted-resources list for the advisory
+    [switch]$IncludeConsumption      # without a Microsoft list: treat Consumption instances as in scope too
+)
 $ErrorActionPreference = 'Stop'
 $out = Join-Path $PWD 'apim-exposure'
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -69,6 +81,7 @@ resources
 | where type =~ 'microsoft.apimanagement/service'
 | project id, name, subscriptionId, resourceGroup, location,
     sku = tostring(sku.name),
+    platformVersion = tostring(properties.platformVersion),
     vnetType = tostring(properties.virtualNetworkType),
     publicAccess = tostring(properties.publicNetworkAccess),
     privateEndpoints = array_length(properties.privateEndpointConnections),
@@ -78,9 +91,64 @@ resources
 "@
 $apim = @(Invoke-Graph $q $subs)
 $apim | Export-Csv "$out\apim-instances.csv"
-$classic = @($apim | Where-Object { $_.sku -notmatch 'V2$' })
-Write-Host "APIM instances: $($apim.Count) total, $($classic.Count) Classic (not v2)"
-$classic | Format-Table name, subscriptionId, sku, vnetType, publicAccess, privateEndpoints -AutoSize
+
+# 1a. Scope. Microsoft's own impacted-resources list wins; otherwise Classic dedicated tiers.
+$listed = $null; $scopeSource = 'rule: Classic dedicated tiers (Developer, Basic, Standard, Premium)' + $(if ($IncludeConsumption) { ' + Consumption' } else { '' })
+function Get-ResourceName([string]$Id) { if ($Id) { ($Id.TrimEnd('/') -split '/')[-1] } }
+if ($ImpactedResourcesCsv) {
+    # The portal export's column names vary; accept a resource ID column, or a service/resource name column
+    $listed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in @(Import-Csv $ImpactedResourcesCsv)) {
+        $cols = @{}; foreach ($p in $r.PSObject.Properties) { $cols[($p.Name -replace '[\s_]', '').ToLower()] = "$($p.Value)".Trim() }
+        $nm = if ($cols['resourceid']) { Get-ResourceName $cols['resourceid'] } elseif ($cols['targetresourceid']) { Get-ResourceName $cols['targetresourceid'] }
+              elseif ($cols['servicename']) { $cols['servicename'] } elseif ($cols['resourcename']) { $cols['resourcename'] } else { $cols['name'] }
+        if ($nm) { [void]$listed.Add($nm) }
+    }
+    if (-not $listed.Count) { throw "No resource names found in $ImpactedResourcesCsv (expected a 'Resource ID', 'Service Name' or 'Resource Name' column)." }
+    $scopeSource = "Microsoft's impacted-resources list from $ImpactedResourcesCsv ($($listed.Count) resources)"
+} else {
+    $events = @(Invoke-Graph "servicehealthresources | where type =~ 'microsoft.resourcehealth/events' | extend p = properties | where tostring(p.EventType) =~ 'SecurityAdvisory' and tostring(p.Title) contains 'API Management' and tostring(p.Title) contains 'Classic' | project trackingId = name, subscriptionId, title = tostring(p.Title)" $subs)
+    if ($events.Count) {
+        $tmp = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); $denied = @()
+        foreach ($e in $events) {
+            $url = "https://management.azure.com/subscriptions/$($e.subscriptionId)/providers/Microsoft.ResourceHealth/events/$($e.trackingId)/listSecurityAdvisoryImpactedResources?api-version=2022-10-01"
+            while ($url) {
+                $res = Invoke-Arm POST $url
+                if (-not $res.ok) { $denied += $e.subscriptionId; break }
+                foreach ($v in @($res.data.value)) { $nm = Get-ResourceName "$($v.properties.targetResourceId)"; if ($nm) { [void]$tmp.Add($nm) } }
+                $url = $res.data.nextLink
+            }
+        }
+        $ids = (@($events.trackingId) | Sort-Object -Unique) -join ', '
+        if (-not $denied.Count) { $listed = $tmp; $scopeSource = "Microsoft's impacted-resources list (Service Health advisory $ids, $($listed.Count) resources)" }
+        else {
+            Write-Warning ("Service Health advisory $ids found, but its impacted-resources list could not be read for $(@($denied | Sort-Object -Unique).Count) subscription(s). " +
+                "That needs e.g. Owner/Contributor or a role with Microsoft.ResourceHealth/events/fetchEventDetails/action. " +
+                "Export the list from Service Health > Security advisories > Impacted Resources and pass it with -ImpactedResourcesCsv. Falling back to the tier rule.")
+        }
+    }
+}
+$scope = foreach ($i in $apim) {
+    $in = $false
+    $reason = if ($listed) { if ($listed.Contains($i.name)) { $in = $true; 'listed by Microsoft' } else { 'not listed by Microsoft' } }
+              elseif ($i.sku -match 'V2$') { 'v2 tier (not affected)' }
+              elseif ($i.sku -eq 'Consumption' -and -not $IncludeConsumption) { 'Consumption tier: not listed by Microsoft in the tenants checked (-IncludeConsumption to include)' }
+              else { $in = $true; 'Classic dedicated tier' }
+    [pscustomobject]@{ id = $i.id; name = $i.name; subscriptionId = $i.subscriptionId; sku = $i.sku; platformVersion = $i.platformVersion
+                       inScope = $in; reason = $reason; scopeSource = $(if ($listed) { 'microsoft' } else { 'rule' }) }
+}
+$scope | Export-Csv "$out\scope.csv"
+$inScopeIds = @($scope | Where-Object inScope | ForEach-Object { $_.id })
+$classic = @($apim | Where-Object { $_.id -in $inScopeIds })
+$outOfScope = @($scope | Where-Object { -not $_.inScope })
+Write-Host "Scope: $scopeSource"
+Write-Host "APIM instances: $($apim.Count) total, $($classic.Count) in scope, $($outOfScope.Count) out of scope"
+$classic | Format-Table name, subscriptionId, sku, platformVersion, vnetType, publicAccess, privateEndpoints -AutoSize
+if ($outOfScope.Count) { $outOfScope | Format-Table name, sku, platformVersion, reason -AutoSize }
+if ($listed) {
+    $unknown = @($listed | Where-Object { $_ -notin @($apim.name) })
+    if ($unknown.Count) { Write-Warning "Listed by Microsoft but not visible to this account: $($unknown -join ', ')" }
+}
 
 # 1b. Preflight: direct per-subscription check. Resource Graph silently hides what you can't read;
 # a direct call returns 403 instead, and an empty list here means "really none".
@@ -236,9 +304,9 @@ resources
     $vaults | Export-Csv "$out\identity-keyvault-access-policies.csv"
     Write-Host "Role assignments: $($rbac.Count); Key Vault access-policy entries: $($vaults.Count)"
 }
-# 4. One-line verdict per Classic instance (also saved to summary.csv)
+# 4. One-line verdict per in-scope instance (also saved to summary.csv, followed by the out-of-scope instances)
 $secretKinds = 'certificates','identityProviders','openidConnectProviders','authorizationServers'
-Write-Host "`n=== Per-instance summary (Classic tier only) ==="
+Write-Host "`n=== Per-instance summary (in-scope instances) ==="
 $summary = foreach ($i in $classic) {
     $mine = @($nvRows | Where-Object { $_.apim -eq $i.name -and $_.subscriptionId -eq $i.subscriptionId })
     $mineOther = @($otherRows | Where-Object { $_.apim -eq $i.name -and $_.subscriptionId -eq $i.subscriptionId })
@@ -270,6 +338,7 @@ $summary = foreach ($i in $classic) {
         directMgmtApi = if ($ti) { $ti.directMgmtApi } else { 'unknown' }
         gitAccess = if ($ti) { $ti.gitAccess } else { 'unknown' }
         hasManagedIdentity = (@($instPrincipals[$i.id]).Count -gt 0)
+        platformVersion = $i.platformVersion; scope = ($scope | Where-Object id -eq $i.id).reason
     }
     $color = switch ($status) { 'UNCHECKED' { 'Red' } 'LIKELY EXPOSED' { 'Yellow' } default { 'Gray' } }
     Write-Host ("{0,-15} {1} [{2}] {3} | vnet={4} public={5} PE={6} | secrets in APIM: {7}, in Key Vault: {8}, logger creds: {9}, certs in APIM: {10}, client-secret objects: {11} | active subscriptions: {12} | direct mgmt API: {13}, git: {14} | identity: {15}" -f `
@@ -278,6 +347,17 @@ $summary = foreach ($i in $classic) {
         $row.directMgmtApi, $row.gitAccess, $row.hasManagedIdentity) -ForegroundColor $color
     $row
 }
+# Out-of-scope instances are listed with the same columns, so the summary accounts for every instance
+$summary = @($summary) + @(foreach ($o in $outOfScope) {
+    $a = $apim | Where-Object id -eq $o.id | Select-Object -First 1
+    [pscustomobject]@{
+        status = 'OUT OF SCOPE'; apim = $o.name; subscriptionId = $o.subscriptionId; sku = $o.sku
+        vnetType = $a.vnetType; publicAccess = $a.publicAccess; privateEndpoints = [int]$a.privateEndpoints
+        secretsInApim = ''; secretsInKeyVault = ''; loggerCredentials = ''; certsInApim = ''; clientSecretObjects = ''; activeSubscriptions = ''
+        directMgmtApi = ''; gitAccess = ''; hasManagedIdentity = ''; platformVersion = $o.platformVersion; scope = $o.reason
+    }
+})
+foreach ($o in $outOfScope) { Write-Host ("{0,-15} {1} {2} ({3})" -f 'OUT OF SCOPE', $o.name, $o.sku, $o.reason) -ForegroundColor DarkGray }
 $summary | Export-Csv "$out\summary.csv"
 Write-Host @"
 Legend: LIKELY EXPOSED = no VNet/private endpoint and/or secrets held by APIM (matches Microsoft's conditions). Secrets held
@@ -286,6 +366,7 @@ Legend: LIKELY EXPOSED = no VNet/private endpoint and/or secrets held by APIM (m
         REVIEW = looks network-integrated with no APIM-held secrets, but compare against Microsoft's
                  'Network security' requirements and check Key Vault access (the managed identity may still reach vaults).
         UNCHECKED = named values, certificates or client-secret objects could not be read (see failed-calls.csv).
+        OUT OF SCOPE = not listed by Microsoft, or (without a Microsoft list) a v2 or Consumption instance. See scope.csv.
         Logger creds = Application Insights logger credentials APIM created itself; shown separately, not used in the status.
         Subscription keys exist on every instance with active subscriptions; direct mgmt API = True means management
         tokens could be issued. Both are listed for rotation planning, not used in the status.

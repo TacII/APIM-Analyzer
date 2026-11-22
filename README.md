@@ -15,6 +15,23 @@ Potentially exposed items include named-value secrets, identity provider and Ope
 
 Because the exact reach of the issue is not fully documented, these tools also look at Key Vaults that APIM managed identities can reach. That is a precaution, not a confirmed attack path.
 
+### Which instances are in scope
+
+**Microsoft's own list is authoritative.** In the Azure portal, open Service Health > Security advisories, select the advisory, and go to **Impacted Resources**. Use **Export to CSV** and pass the file to the exposure script:
+
+```powershell
+pwsh ./Check-ApimExposure.ps1 -ImpactedResourcesCsv ./impacted-resources.csv
+```
+
+If your account may read the advisory's impacted resources through the API (Owner/Contributor, or a role with `Microsoft.ResourceHealth/events/fetchEventDetails/action`), the script fetches the list itself.
+
+Without that list, the script falls back to a rule: **Classic dedicated tiers** (Developer, Basic, Standard, Premium).
+- **v2 tiers** are never in scope.
+- **Consumption** (multi-tenant platform `mtv1`) is out of scope by default. Microsoft's notice names it among the Classic tiers, but in the tenants checked so far Microsoft's impacted-resources list included only dedicated-tier instances. Add `-IncludeConsumption` to include it anyway.
+- **Platform version** (`stv1`/`stv2`) is shown but not used. Instances on `stv2.1` were listed as impacted.
+
+The decision per instance is written to `apim-exposure/scope.csv`. The audit and analysis scripts use that file when it exists, so all three scripts work on the same set.
+
 ## What is in this repo
 
 | File | Purpose |

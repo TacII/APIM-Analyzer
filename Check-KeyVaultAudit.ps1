@@ -14,7 +14,9 @@ param(
     [string]$OutDir = (Join-Path $PWD 'kv-audit'),
     [datetime]$WindowStart = '2026-11-16',   # UTC, inclusive: start of the period to scrutinise
     [datetime]$WindowEnd   = '2026-11-21',   # UTC, exclusive
-    [int]$LookbackDays = 90                  # how far back to read logs (baseline = everything before WindowStart)
+    [int]$LookbackDays = 90,                 # how far back to read logs (baseline = everything before WindowStart)
+    [string]$ScopeFile = (Join-Path $PWD 'apim-exposure/scope.csv'),   # from Check-ApimExposure.ps1, if present
+    [switch]$IncludeConsumption              # without a scope file: treat Consumption instances as in scope too
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -82,9 +84,18 @@ function Get-Ips($v) {
 # ---- 1. APIM Classic instances and their managed identities -------------------------------------
 $subs = @(az account list --query "[?state=='Enabled'].id" -o tsv)
 Write-Host "Subscriptions: $($subs.Count)"
-$apim = @(Invoke-Graph "resources | where type =~ 'microsoft.apimanagement/service' | project id, name, subscriptionId, sku = tostring(sku.name), publicIPs = properties.publicIPAddresses, privateIPs = properties.privateIPAddresses, identity" $subs |
-    Where-Object { $_.sku -notmatch 'V2$' })
-Write-Host "Classic APIM instances: $($apim.Count)"
+$allApim = @(Invoke-Graph "resources | where type =~ 'microsoft.apimanagement/service' | project id, name, subscriptionId, sku = tostring(sku.name), publicIPs = properties.publicIPAddresses, privateIPs = properties.privateIPAddresses, identity" $subs)
+# Scope: the scope file from Check-ApimExposure.ps1 (which uses Microsoft's impacted-resources list when it can),
+# otherwise Classic dedicated tiers. v2 is never in scope; Consumption only with -IncludeConsumption.
+if (Test-Path $ScopeFile) {
+    $inScope = @(Import-Csv $ScopeFile | Where-Object { $_.inScope -eq 'True' } | ForEach-Object { $_.id.ToLower() })
+    $apim = @($allApim | Where-Object { $_.id.ToLower() -in $inScope })
+    Write-Host "Scope from $ScopeFile"
+} else {
+    $apim = @($allApim | Where-Object { $_.sku -notmatch 'V2$' -and ($IncludeConsumption -or $_.sku -ne 'Consumption') })
+    Write-Host "Scope: Classic dedicated tiers$(if ($IncludeConsumption) { ' + Consumption' }) (no scope file at $ScopeFile)"
+}
+Write-Host "APIM instances in scope: $($apim.Count) of $($allApim.Count)"
 
 $principalMap = @{}
 foreach ($i in $apim) {
@@ -99,7 +110,7 @@ foreach ($i in $apim) {
         $principalMap[$k] += $i
     }
 }
-if (-not $principalMap.Count) { Write-Warning 'No managed identities found on Classic APIM instances. Nothing to correlate; stopping.'; return }
+if (-not $principalMap.Count) { Write-Warning 'No managed identities found on in-scope APIM instances. Nothing to correlate; stopping.'; return }
 Write-Host "Managed identities: $($principalMap.Count)"
 $plist = ($principalMap.Keys | ForEach-Object { "'$_'" }) -join ','
 
