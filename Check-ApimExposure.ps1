@@ -1,14 +1,15 @@
 #Requires -Version 7
 <#
 Checks every enabled subscription you can see for Azure API Management Classic instances
-and writes CSVs to .\apim-exposure\ . Read-only. Needs Reader on the subscriptions.
+and writes CSVs to .\apim-exposure\ . Read-only. Needs Reader on the subscriptions
+and Apim-Helpers.ps1 alongside this script.
 Run `az login` first (az CLI).
 
 Which instances are in scope:
   1. Microsoft's own list of impacted resources, when available - from -ImpactedResourcesCsv (Service Health >
      Security advisories > the advisory > Impacted Resources > Export to CSV), or read from the Service Health
      API if your account may (Owner/Contributor or a role with Microsoft.ResourceHealth/events/fetchEventDetails/action).
-  2. Otherwise: Classic dedicated tiers (Developer, Basic, Standard, Premium). v2 tiers are not affected, and
+  2. Otherwise: Classic dedicated tiers (Developer, Basic, Standard, Premium, Isolated). v2 tiers are not affected, and
      Consumption instances were not listed by Microsoft in the tenants checked so far; add -IncludeConsumption
      to include them anyway.
 
@@ -21,6 +22,7 @@ param(
     [switch]$IncludeConsumption      # without a Microsoft list: treat Consumption instances as in scope too
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Apim-Helpers.ps1')
 $out = Join-Path $PWD 'apim-exposure'
 New-Item -ItemType Directory -Force $out | Out-Null
 
@@ -29,8 +31,8 @@ New-Item -ItemType Directory -Force $out | Out-Null
 $script:armToken = $null
 function Get-ArmToken {
     if (-not $script:armToken -or $script:armToken.expires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
-        $t = az account get-access-token --resource 'https://management.azure.com/' -o json | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0 -or -not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
+        $t = Invoke-AzJson @('account', 'get-access-token', '--resource', 'https://management.azure.com/')
+        if (-not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
         $exp = if ($t.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$t.expires_on) } else { [DateTimeOffset]::new([datetime]$t.expiresOn) }
         $script:armToken = @{ value = $t.accessToken; expires = $exp }
     }
@@ -43,7 +45,7 @@ function Invoke-Arm([string]$Method, [string]$Url, $Body) {
         if ($null -ne $Body) { $p.Body = ($Body | ConvertTo-Json -Depth 10 -Compress); $p.ContentType = 'application/json' }
         try { return [pscustomobject]@{ ok = $true; data = (Invoke-RestMethod @p) } }
         catch {
-            $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+            $code = if ($null -ne $_.Exception.Response.StatusCode) { [int]$_.Exception.Response.StatusCode } else { 0 }
             if ($try -lt 4 -and ($code -eq 429 -or $code -ge 500)) { Start-Sleep -Seconds ([Math]::Pow(2, $try)); continue }
             $msg = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
             return [pscustomobject]@{ ok = $false; error = "HTTP $code $msg" }
@@ -57,6 +59,7 @@ function Invoke-Graph([string]$Query, [string[]]$Subs, [string]$ScopeFilter) {
     for ($c = 0; $c -lt $Subs.Count; $c += 1000) {
         $chunk = @($Subs[$c..([Math]::Min($c + 999, $Subs.Count - 1))])
         $got = 0; $skip = $null
+        $tokens = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         do {
             $opts = [ordered]@{ '$top' = 1000; resultFormat = 'objectArray' }
             if ($skip) { $opts['$skipToken'] = $skip }
@@ -65,14 +68,18 @@ function Invoke-Graph([string]$Query, [string[]]$Subs, [string]$ScopeFilter) {
                 @{ subscriptions = $chunk; query = $Query; options = $opts }
             if (-not $res.ok) { throw "Resource Graph query failed: $($res.error)" }
             $r = $res.data
+            Assert-ResponseCollection $r 'data' 'Resource Graph'
             foreach ($d in @($r.data)) { $got++; $d }
-            $skip = $r.'$skipToken'
+            $next = $r.'$skipToken'
+            if ($next -and -not $tokens.Add("$next")) { throw 'Resource Graph repeated a continuation token; paging aborted.' }
+            $skip = $next
+            if ("$($r.resultTruncated)" -eq 'true' -and -not $skip) { throw 'Resource Graph truncated results without a continuation token.' }
         } while ($skip)
         if ($r.totalRecords -gt $got) { throw "Result truncated ($got of $($r.totalRecords)) - the query is not being applied as intended." }
     }
 }
 
-$subs = @(az account list --query "[?state=='Enabled'].id" -o tsv)
+$subs = @(Get-EnabledSubscription)
 Write-Host "Searching $($subs.Count) subscriptions..."
 
 # 1. All APIM instances, with tier, network settings and identity
@@ -84,47 +91,20 @@ resources
     platformVersion = tostring(properties.platformVersion),
     vnetType = tostring(properties.virtualNetworkType),
     publicAccess = tostring(properties.publicNetworkAccess),
-    privateEndpoints = array_length(properties.privateEndpointConnections),
+    privateEndpoints = coalesce(array_length(properties.privateEndpointConnections), 0),
+    privateEndpointConnections = tostring(properties.privateEndpointConnections),
     publicIPs = tostring(properties.publicIPAddresses),
     privateIPs = tostring(properties.privateIPAddresses),
     identity = tostring(identity)
 "@
 $apim = @(Invoke-Graph $q $subs)
+foreach ($instance in $apim) {
+    if (-not $instance.id -or -not $instance.name) { throw 'Resource Graph returned an APIM instance without an ID or name.' }
+}
 $apim | Export-Csv "$out\apim-instances.csv"
 
 # 1a. Scope. Microsoft's own impacted-resources list wins; otherwise Classic dedicated tiers.
-$listed = $null; $scopeSource = 'rule: Classic dedicated tiers (Developer, Basic, Standard, Premium)' + $(if ($IncludeConsumption) { ' + Consumption' } else { '' })
-function Get-ResourceName([string]$Id) { if ($Id) { ($Id.TrimEnd('/') -split '/')[-1] } }
-# Tier family from the SKU. Note: stv2/stv2.1 in platformVersion is the compute platform of the *Classic* tiers,
-# not the v2 tiers. The v2 tiers are the SKUs BasicV2, StandardV2 and PremiumV2.
-function Get-TierFamily([string]$Sku) {
-    if ($Sku -match 'V2$') { return 'v2' }
-    if ($Sku -eq 'Consumption') { return 'Classic (Consumption)' }
-    return 'Classic'
-}
-# A Microsoft list holds full resource IDs where available (preferred) and bare names otherwise.
-function New-ImpactedList { [pscustomobject]@{ ids = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-                                               names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) } }
-function Add-Impacted($List, [string]$ResourceId, [string]$Name) {
-    if ($ResourceId -and $ResourceId -match '^/subscriptions/') { [void]$List.ids.Add($ResourceId.TrimEnd('/')) }
-    elseif ($Name) { [void]$List.names.Add($Name.Trim()) }
-}
-# Scope decision for one instance. $Listed is $null without a Microsoft list.
-function Get-ScopeDecision($Instance, $Listed, [switch]$IncludeConsumption) {
-    $family = Get-TierFamily $Instance.sku
-    $d = { param($in, $reason) [pscustomobject]@{ inScope = $in; tierFamily = $family; reason = $reason } }
-    if ($Listed) {
-        $isListed = $Listed.ids.Contains("$($Instance.id)".TrimEnd('/')) -or $Listed.names.Contains("$($Instance.name)")
-        if (-not $isListed) { return & $d $false 'not listed by Microsoft' }
-        # v2 tiers are not affected. A listed v2 instance was most likely migrated after the incident: keep it in
-        # scope (its secrets may have been exposed while it was Classic) but never rate it LIKELY EXPOSED.
-        if ($family -eq 'v2') { return & $d $true 'listed by Microsoft, but now a v2 tier (migrated after the incident?)' }
-        return & $d $true 'listed by Microsoft'
-    }
-    if ($family -eq 'v2') { return & $d $false 'v2 tier (not affected)' }
-    if ($family -eq 'Classic (Consumption)' -and -not $IncludeConsumption) { return & $d $false 'Consumption tier: not listed by Microsoft in the tenants checked (-IncludeConsumption to include)' }
-    return & $d $true "Classic dedicated tier (platform $(if ($Instance.platformVersion) { $Instance.platformVersion } else { 'unknown' }))"
-}
+$listed = $null; $scopeSource = 'rule: Classic dedicated tiers (Developer, Basic, Standard, Premium, Isolated)' + $(if ($IncludeConsumption) { ' + Consumption' } else { '' })
 
 # Status for an in-scope instance. A v2-tier instance is never rated LIKELY EXPOSED (it is only in scope when
 # Microsoft lists it, i.e. it was Classic during the incident and has been migrated since).
@@ -136,17 +116,54 @@ function Get-StatusLabel([string]$Status, [string]$TierFamily, [string]$Platform
     return $Status
 }
 function Get-InstanceStatus([switch]$Unchecked, [string]$TierFamily, [switch]$NoNetwork, [switch]$SecretsHeld) {
-    if ($Unchecked) { return 'UNCHECKED' }
+    if ($Unchecked -or $TierFamily -notin 'Classic', 'Classic (Consumption)', 'v2') { return 'UNCHECKED' }
     if ($TierFamily -eq 'v2') { return 'REVIEW (v2 tier)' }
     if ($NoNetwork -or $SecretsHeld) { return 'LIKELY EXPOSED' }
     return 'REVIEW'
+}
+
+function Get-NetworkAssessment($Instance) {
+    if ((Get-TierFamily $Instance.sku) -eq 'v2') {
+        return [pscustomobject]@{ noNetwork = $false; unchecked = $false; approvedEndpoints = $null }
+    }
+    if ((Get-TierFamily $Instance.sku) -eq 'Classic (Consumption)') {
+        return [pscustomobject]@{ noNetwork = $true; unchecked = $false; approvedEndpoints = 0 }
+    }
+    $vnet = "$($Instance.vnetType)".Trim()
+    $public = "$($Instance.publicAccess)".Trim()
+    $unchecked = $false; $approved = 0
+    if ($vnet -notin 'None', 'Internal', 'External' -or $public -notin 'Enabled', 'Disabled') {
+        Write-Warning "$($Instance.name): missing or unrecognized network settings (vnet='$vnet', publicAccess='$public'). Network assessment is incomplete."
+        $unchecked = $true
+    }
+    $connections = $Instance.privateEndpointConnections
+    if ($connections -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($connections)) { $connections = @() }
+        else {
+            try { $connections = ConvertFrom-Json -InputObject $connections -NoEnumerate -ErrorAction Stop }
+            catch { Write-Warning "$($Instance.name): invalid private-endpoint JSON. Network assessment is incomplete."; $unchecked = $true; $connections = @() }
+        }
+    }
+    if ($null -eq $connections -or $connections -isnot [System.Collections.IList]) {
+        Write-Warning "$($Instance.name): private-endpoint connection details are missing or invalid. Network assessment is incomplete."
+        $unchecked = $true; $connections = @()
+    }
+    foreach ($connection in $connections) {
+        $state = $connection.properties.privateLinkServiceConnectionState.status
+        if ($state -eq 'Approved') { $approved++ }
+        elseif ($state -notin 'Pending', 'Rejected', 'Disconnected') {
+            Write-Warning "$($Instance.name): unrecognized private-endpoint state '$state'. Network assessment is incomplete."
+            $unchecked = $true
+        }
+    }
+    [pscustomobject]@{ noNetwork = ($vnet -eq 'None' -and $approved -eq 0); unchecked = $unchecked; approvedEndpoints = $approved }
 }
 
 if ($ImpactedResourcesCsv) {
     # The portal export's column names vary; accept a resource ID column, or a service/resource name column
     $listed = New-ImpactedList
     foreach ($r in @(Import-Csv $ImpactedResourcesCsv)) {
-        $cols = @{}; foreach ($p in $r.PSObject.Properties) { $cols[($p.Name -replace '[\s_]', '').ToLower()] = "$($p.Value)".Trim() }
+        $cols = @{}; foreach ($p in $r.PSObject.Properties) { $cols[($p.Name -replace '[\s_]', '').ToLowerInvariant()] = "$($p.Value)".Trim() }
         $rid = if ($cols['resourceid']) { $cols['resourceid'] } else { $cols['targetresourceid'] }
         $nm = if ($cols['servicename']) { $cols['servicename'] } elseif ($cols['resourcename']) { $cols['resourcename'] } else { $cols['name'] }
         Add-Impacted $listed $rid $nm
@@ -159,9 +176,12 @@ if ($ImpactedResourcesCsv) {
         $tmp = New-ImpactedList; $denied = @()
         foreach ($e in $events) {
             $url = "https://management.azure.com/subscriptions/$($e.subscriptionId)/providers/Microsoft.ResourceHealth/events/$($e.trackingId)/listSecurityAdvisoryImpactedResources?api-version=2022-10-01"
+            $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             while ($url) {
+                if (-not $seen.Add($url)) { throw 'Service Health repeated a nextLink; impacted-resource paging aborted.' }
                 $res = Invoke-Arm POST $url
                 if (-not $res.ok) { $denied += $e.subscriptionId; break }
+                Assert-ResponseCollection $res.data 'value' 'Service Health impacted resources'
                 foreach ($v in @($res.data.value)) { $tr = "$($v.properties.targetResourceId)"; Add-Impacted $tmp $tr (Get-ResourceName $tr) }
                 $url = $res.data.nextLink
             }
@@ -203,9 +223,14 @@ $pre = foreach ($s in $subs) {
     $n++; Write-Host "Preflight $n/$($subs.Count): $s"
     $direct = 0; $err = $null
     $url = "https://management.azure.com/subscriptions/$s/providers/Microsoft.ApiManagement/service?api-version=2024-05-01"
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     while ($url -and -not $err) {
+        if (-not $seen.Add($url)) { $err = 'Repeated nextLink; APIM inventory paging aborted.'; break }
         $res = Invoke-Arm GET $url
-        if ($res.ok) { $direct += @($res.data.value).Count; $url = $res.data.nextLink } else { $err = $res.error }
+        if ($res.ok) {
+            Assert-ResponseCollection $res.data 'value' 'APIM subscription inventory'
+            $direct += @($res.data.value).Count; $url = $res.data.nextLink
+        } else { $err = $res.error }
     }
     if (-not $err) {
         $viaGraph = @($apim | Where-Object { $_.subscriptionId -eq $s }).Count
@@ -225,18 +250,22 @@ if ($mm.Count) { Write-Warning "Graph and direct counts differ for: $($mm.subscr
 if (-not $bad.Count -and -not $mm.Count) { Write-Host 'Preflight clean: every subscription was readable and counts agree.' -ForegroundColor Green }
 
 # 2. Named values and other secret-bearing objects on Classic instances
-$script:failures = @()
+$script:failures = [System.Collections.Generic.List[object]]::new()
 # A pricing tier that does not support an object kind (e.g. identity providers on Consumption) is not a failure:
 # there is nothing of that kind to expose.
 function Test-NotInTier([string]$Err) { return $Err -match 'MethodNotAllowedInPricingTier' }
 function Get-Paged([string]$Url) {
     $orig = $Url
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     while ($Url) {
+        if (-not $seen.Add($Url)) { $script:failures.Add([pscustomobject]@{ url = $orig; error = 'Repeated nextLink; paging aborted.' }); return }
         $res = Invoke-Arm GET $Url
         if (-not $res.ok) {
-            if (-not (Test-NotInTier $res.error)) { $script:failures += [pscustomobject]@{ url = $orig; error = $res.error } }
+            if (-not (Test-NotInTier $res.error)) { $script:failures.Add([pscustomobject]@{ url = $orig; error = $res.error }) }
             return
         }
+        try { Assert-ResponseCollection $res.data 'value' $Url }
+        catch { $script:failures.Add([pscustomobject]@{ url = $orig; error = $_.Exception.Message }); return }
         $res.data.value
         $Url = $res.data.nextLink
     }
@@ -244,24 +273,18 @@ function Get-Paged([string]$Url) {
 function Get-One([string]$Url) {
     $res = Invoke-Arm GET $Url
     if (-not $res.ok) {
-        if (-not (Test-NotInTier $res.error)) { $script:failures += [pscustomobject]@{ url = $Url; error = $res.error } }
+        if (Test-NotInTier $res.error) { return [pscustomobject]@{ unsupported = $true } }
+        $script:failures.Add([pscustomobject]@{ url = $Url; error = $res.error })
         return $null
     }
     return $res.data
 }
-# Principal IDs (lower-case) of the instance's managed identities. An identity block of type 'None' has none.
-function Get-PrincipalIds($Identity) {
-    if (-not $Identity) { return @() }
-    $idn = if ($Identity -is [string]) { $Identity | ConvertFrom-Json } else { $Identity }
-    if (-not $idn -or $idn.type -eq 'None') { return @() }
-    $ids = @()
-    if ($idn.principalId) { $ids += $idn.principalId }
-    if ($idn.userAssignedIdentities) { $ids += @($idn.userAssignedIdentities.PSObject.Properties.Value | ForEach-Object { $_.principalId }) }
-    return @($ids | Where-Object { $_ } | ForEach-Object { "$_".ToLower() } | Sort-Object -Unique)
-}
 $base = 'https://management.azure.com'
 $api = 'api-version=2024-05-01'
-$nvRows = @(); $otherRows = @(); $subRows = @(); $principals = @()
+$nvRows = [System.Collections.Generic.List[object]]::new()
+$otherRows = [System.Collections.Generic.List[object]]::new()
+$subRows = [System.Collections.Generic.List[object]]::new()
+$principals = [System.Collections.Generic.List[string]]::new()
 $tenantInfo = @{}; $instPrincipals = @{}
 
 foreach ($i in $classic) {
@@ -270,46 +293,46 @@ foreach ($i in $classic) {
         foreach ($v in Get-Paged "$base$($i.id)/namedValues?$api") {
             # 'Logger-Credentials-…' named values are created by APIM for Application Insights loggers (instrumentation
             # key / connection string). They are kept apart from other secrets: low impact, but often left behind in bulk.
-            $nvRows += [pscustomobject]@{
+            $nvRows.Add([pscustomobject]@{
                 apim = $i.name; subscriptionId = $i.subscriptionId; namedValue = $v.name; displayName = $v.properties.displayName
-                secret = $v.properties.secret; inKeyVault = [bool]$v.properties.keyVault
+                secret = ConvertTo-ReportBoolean $v.properties.secret "secret flag for $($i.name)/$($v.name)"; inKeyVault = [bool]$v.properties.keyVault
                 loggerCredential = ("$($v.properties.displayName)" -like 'Logger-Credentials*')
-            }
+            })
         }
         foreach ($kind in 'identityProviders','openidConnectProviders','authorizationServers','backends','loggers','authorizationProviders') {
             foreach ($v in Get-Paged "$base$($i.id)/$($kind)?$api") {
-                $otherRows += [pscustomobject]@{ apim = $i.name; subscriptionId = $i.subscriptionId; kind = $kind; name = $v.name; storedIn = '' }
+                $otherRows.Add([pscustomobject]@{ apim = $i.name; subscriptionId = $i.subscriptionId; kind = $kind; name = $v.name; storedIn = '' })
             }
         }
         # Certificates uploaded directly (private key held by APIM) versus referenced from Key Vault
         foreach ($v in Get-Paged "$base$($i.id)/certificates?$api") {
-            $otherRows += [pscustomobject]@{ apim = $i.name; subscriptionId = $i.subscriptionId; kind = 'certificates'; name = $v.name
-                                             storedIn = if ($v.properties.keyVault) { 'Key Vault' } else { 'APIM' } }
+            $otherRows.Add([pscustomobject]@{ apim = $i.name; subscriptionId = $i.subscriptionId; kind = 'certificates'; name = $v.name
+                                             storedIn = if ($v.properties.keyVault) { 'Key Vault' } else { 'APIM' } })
         }
         # APIM subscriptions: their keys live in APIM. Only metadata is read here, never the keys themselves.
         foreach ($v in Get-Paged "$base$($i.id)/subscriptions?$api") {
-            $subRows += [pscustomobject]@{ apim = $i.name; subscriptionId = $i.subscriptionId; apimSubscription = $v.name
-                                           displayName = $v.properties.displayName; scope = $v.properties.scope; state = $v.properties.state }
+            $subRows.Add([pscustomobject]@{ apim = $i.name; subscriptionId = $i.subscriptionId; apimSubscription = $v.name
+                                           displayName = $v.properties.displayName; scope = $v.properties.scope; state = $v.properties.state })
         }
         # Direct management API (management tokens) and Git configuration access. Not available on Consumption.
-        if ($i.sku -eq 'Consumption') {
+        if ((Get-TierFamily $i.sku) -in 'Classic (Consumption)', 'v2') {
             $tenantInfo[$i.id] = [pscustomobject]@{ directMgmtApi = 'n/a'; gitAccess = 'n/a' }
         } else {
             $ta = Get-One "$base$($i.id)/tenant/access?$api"
             $ga = Get-One "$base$($i.id)/tenant/gitAccess?$api"
             $tenantInfo[$i.id] = [pscustomobject]@{
-                directMgmtApi = if ($ta) { [bool]$ta.properties.enabled } else { 'unknown' }
-                gitAccess     = if ($ga) { [bool]$ga.properties.enabled } else { 'unknown' }
+                directMgmtApi = if ($ta.unsupported) { 'n/a' } elseif ($ta) { ConvertTo-ReportBoolean $ta.properties.enabled "$($i.name) direct management API enabled" } else { 'unknown' }
+                gitAccess     = if ($ga.unsupported) { 'n/a' } elseif ($ga) { ConvertTo-ReportBoolean $ga.properties.enabled "$($i.name) Git access enabled" } else { 'unknown' }
             }
         }
     } catch {
         Write-Warning "$($i.name): $($_.Exception.Message)"
-        $script:failures += [pscustomobject]@{ url = "$base$($i.id)/namedValues?$api"; error = "inspection aborted: $($_.Exception.Message)" }
+        $script:failures.Add([pscustomobject]@{ url = "$base$($i.id)/namedValues?$api"; error = "inspection aborted: $($_.Exception.Message)" })
     }
 
     $p = @(Get-PrincipalIds $i.identity)
     $instPrincipals[$i.id] = $p
-    $principals += $p
+    $principals.AddRange([string[]]$p)
 }
 $script:failures | Export-Csv "$out\failed-calls.csv"
 if ($script:failures.Count) {
@@ -368,14 +391,14 @@ $summary = foreach ($i in $classic) {
     $nvFailed = 'namedValues' -in $failedKinds
     $otherFailed = @($failedKinds | Where-Object { $_ -in $secretKinds }).Count -gt 0
     $ti = $tenantInfo[$i.id]
-    $pe = [int]$i.privateEndpoints
-    $noNet = ($i.vnetType -eq 'None' -and $pe -eq 0)
+    $pe = $i.privateEndpoints
+    $network = Get-NetworkAssessment $i
     $sc = $scope | Where-Object id -eq $i.id | Select-Object -First 1
-    $status = Get-InstanceStatus -Unchecked:($nvFailed -or $otherFailed) -TierFamily $sc.tierFamily -NoNetwork:$noNet `
+    $status = Get-InstanceStatus -Unchecked:($nvFailed -or $otherFailed -or $network.unchecked) -TierFamily $sc.tierFamily -NoNetwork:$network.noNetwork `
                                  -SecretsHeld:($inApim -gt 0 -or $certsInApim -gt 0 -or $clientSecretObjs -gt 0)
     $row = [pscustomobject]@{
         status = $status; apim = $i.name; subscriptionId = $i.subscriptionId; sku = $i.sku
-        vnetType = $i.vnetType; publicAccess = $i.publicAccess; privateEndpoints = $pe
+        vnetType = $i.vnetType; publicAccess = $i.publicAccess; privateEndpoints = $pe; approvedPrivateEndpoints = $network.approvedEndpoints
         secretsInApim = if ($nvFailed) { 'n/a' } else { $inApim }; secretsInKeyVault = if ($nvFailed) { 'n/a' } else { $inKv }
         loggerCredentials = if ($nvFailed) { 'n/a' } else { $loggerInApim }
         certsInApim = if ($otherFailed) { 'n/a' } else { $certsInApim }
@@ -398,7 +421,7 @@ $summary = @($summary) + @(foreach ($o in $outOfScope) {
     $a = $apim | Where-Object id -eq $o.id | Select-Object -First 1
     [pscustomobject]@{
         status = 'OUT OF SCOPE'; apim = $o.name; subscriptionId = $o.subscriptionId; sku = $o.sku
-        vnetType = $a.vnetType; publicAccess = $a.publicAccess; privateEndpoints = [int]$a.privateEndpoints
+        vnetType = $a.vnetType; publicAccess = $a.publicAccess; privateEndpoints = $a.privateEndpoints; approvedPrivateEndpoints = ''
         secretsInApim = ''; secretsInKeyVault = ''; loggerCredentials = ''; certsInApim = ''; clientSecretObjects = ''; activeSubscriptions = ''
         directMgmtApi = ''; gitAccess = ''; hasManagedIdentity = ''; tierFamily = $o.tierFamily; platformVersion = $o.platformVersion; scope = $o.reason
     }
@@ -411,7 +434,8 @@ Legend: LIKELY EXPOSED = no VNet/private endpoint and/or secrets held by APIM (m
                  OpenID Connect / authorization server configurations (these may carry client secrets).
         REVIEW = looks network-integrated with no APIM-held secrets, but compare against Microsoft's
                  'Network security' requirements and check Key Vault access (the managed identity may still reach vaults).
-        UNCHECKED = named values, certificates or client-secret objects could not be read (see failed-calls.csv).
+        UNCHECKED = unknown SKU/network settings, or named values, certificates or client-secret objects could not be read.
+                    See warnings, scope.csv and failed-calls.csv. Only Approved private endpoints count as protection.
         OUT OF SCOPE = not listed by Microsoft, or (without a Microsoft list) a v2 or Consumption instance. See scope.csv.
         REVIEW (v2 tier) = listed by Microsoft but now a v2 tier (BasicV2/StandardV2/PremiumV2), probably migrated after the
                  incident. Its secrets may have been exposed while it was Classic; v2 itself is not affected.
