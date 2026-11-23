@@ -32,6 +32,7 @@ Describe 'Offline three-script workflow' {
         $previousExitCode = $global:LASTEXITCODE
         $script:subId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         $script:principal = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+        $script:tenantId = '11111111-1111-1111-1111-111111111111'
         $script:vaultId = "/subscriptions/$script:subId/resourceGroups/test/providers/Microsoft.KeyVault/vaults/test-vault"
         $script:workspaceId = "/subscriptions/$script:subId/resourceGroups/test/providers/Microsoft.OperationalInsights/workspaces/test-workspace"
         $script:inventory = @(
@@ -48,7 +49,8 @@ Describe 'Offline three-script workflow' {
             }
         )
         $global:ApimWorkflowFixture = @{
-            subId = $script:subId; principal = $script:principal
+            subId = $script:subId; principal = $script:principal; tenantId = $script:tenantId
+            accounts = @(@{ id = $script:subId; state = 'Enabled'; tenantId = $script:tenantId; isDefault = $true })
             vaultId = $script:vaultId; workspaceId = $script:workspaceId
             inventory = $script:inventory; partialLogs = $false; repeatGraphToken = $false
             directoryFailed = $false; sharedQueryFailed = $false
@@ -62,8 +64,8 @@ Describe 'Offline three-script workflow' {
             if ($Arguments -contains 'get-access-token') {
                 return (@{ accessToken = 'offline-test-token'; expires_on = [DateTimeOffset]::UtcNow.AddHours(1).ToUnixTimeSeconds() } | ConvertTo-Json -Compress)
             }
-            if ($Arguments -contains 'list') { return (@(@{ id = $global:ApimWorkflowFixture.subId; state = 'Enabled' }) | ConvertTo-Json -AsArray -Compress) }
-            if ($Arguments -contains 'show') { return (@{ id = $global:ApimWorkflowFixture.subId } | ConvertTo-Json -Compress) }
+            if ($Arguments -contains 'list') { return ($global:ApimWorkflowFixture.accounts | ConvertTo-Json -AsArray -Compress) }
+            if ($Arguments -contains 'show') { return (@{ id = $global:ApimWorkflowFixture.subId; tenantId = $global:ApimWorkflowFixture.tenantId } | ConvertTo-Json -Compress) }
             throw "Unexpected mock CLI arguments: $Arguments"
         }
         Mock Invoke-RestMethod {
@@ -270,5 +272,34 @@ Describe 'Offline three-script workflow' {
         & (Join-Path $repo 'Analyze-Findings.ps1')
         @(Import-Csv '.\incident-analysis\caller-drilldown.csv')[0].verdict |
             Should -Be 'NOT ANALYSED - log queries failed or returned incomplete results'
+    }
+
+    It 'reads one tenant per run and reports the subscriptions it skips in other tenants' {
+        $global:ApimWorkflowFixture.accounts += @(
+            @{ id = 'dddddddd-dddd-dddd-dddd-dddddddddddd'; state = 'Enabled'; tenantId = '22222222-2222-2222-2222-222222222222'; isDefault = $false }
+            @{ id = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'; state = 'Enabled'; tenantId = '22222222-2222-2222-2222-222222222222'; isDefault = $false }
+            @{ id = '22222222-2222-2222-2222-222222222222'; name = 'N/A(tenant level account)'; state = 'Enabled'; tenantId = '22222222-2222-2222-2222-222222222222'; isDefault = $false }
+        )
+        & (Join-Path $repo 'Check-ApimExposure.ps1')
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -like 'Skipping 2 subscription(s) in 1 other tenant(s): 22222222-2222-2222-2222-222222222222 (2).*' }
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq "Tenant $($global:ApimWorkflowFixture.tenantId): searching 1 subscription(s)..." }
+        Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -like '*/subscriptions/dddddddd-*' -or $Uri -like '*/subscriptions/eeeeeeee-*' -or $Uri -like '*/subscriptions/22222222-*' }
+        @(Import-Csv '.\apim-exposure\subscription-access.csv').Count | Should -Be 1
+    }
+
+    It 'reads the tenant named by -TenantId and requests its tokens for that tenant' {
+        $global:ApimWorkflowFixture.accounts += @(@{ id = 'dddddddd-dddd-dddd-dddd-dddddddddddd'; state = 'Enabled'; tenantId = '22222222-2222-2222-2222-222222222222'; isDefault = $false })
+        & (Join-Path $repo 'Check-KeyVaultAudit.ps1') -TenantId '22222222-2222-2222-2222-222222222222' -ScopeFile '.\missing-scope.csv'
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq 'Tenant 22222222-2222-2222-2222-222222222222: 1 subscription(s)' }
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { $Arguments -contains 'show' }
+        Should -Invoke az -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -contains '--tenant' -and $Arguments -contains '22222222-2222-2222-2222-222222222222' }
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -notcontains '--tenant' }
+    }
+
+    It 'requests analysis tokens in the tenant named by -TenantId' {
+        & (Join-Path $repo 'Check-ApimExposure.ps1')
+        Write-TestCallerInput
+        & (Join-Path $repo 'Analyze-Findings.ps1') -TenantId '22222222-2222-2222-2222-222222222222'
+        Should -Invoke az -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -contains '--tenant' -and $Arguments -contains '22222222-2222-2222-2222-222222222222' }
     }
 }

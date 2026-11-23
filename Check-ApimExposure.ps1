@@ -19,7 +19,8 @@ License: MIT (see LICENSE). Provided as is, without warranty.
 #>
 param(
     [string]$ImpactedResourcesCsv,   # export of Microsoft's impacted-resources list for the advisory
-    [switch]$IncludeConsumption      # without a Microsoft list: treat Consumption instances as in scope too
+    [switch]$IncludeConsumption,     # without a Microsoft list: treat Consumption instances as in scope too
+    [string]$TenantId                  # Entra tenant to read; default: the tenant of the current az account (subscriptions in other tenants are skipped)
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Apim-Helpers.ps1')
@@ -31,7 +32,9 @@ New-Item -ItemType Directory -Force $out | Out-Null
 $script:armToken = $null
 function Get-ArmToken {
     if (-not $script:armToken -or $script:armToken.expires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
-        $t = Invoke-AzJson @('account', 'get-access-token', '--resource', 'https://management.azure.com/')
+        $azArgs = @('account', 'get-access-token', '--resource', 'https://management.azure.com/')
+        if ($script:tenantId) { $azArgs += @('--tenant', $script:tenantId) }
+        $t = Invoke-AzJson $azArgs
         if (-not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
         $exp = if ($t.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$t.expires_on) } else { [DateTimeOffset]::new([datetime]$t.expiresOn) }
         $script:armToken = @{ value = $t.accessToken; expires = $exp }
@@ -79,8 +82,12 @@ function Invoke-Graph([string]$Query, [string[]]$Subs, [string]$ScopeFilter) {
     }
 }
 
-$subs = @(Get-EnabledSubscription)
-Write-Host "Searching $($subs.Count) subscriptions..."
+# One tenant per run: a token is valid for one tenant, so only that tenant's enabled subscriptions are read and the
+# rest are listed and skipped (Get-EnabledSubscription in Apim-Helpers.ps1). Pass -TenantId <id> after
+# `az login --tenant <id>` to read another tenant.
+$script:tenantId = Get-AzTenantId $TenantId
+$subs = @(Get-EnabledSubscription -TenantId $script:tenantId)
+Write-Host "Tenant $($script:tenantId): searching $($subs.Count) subscription(s)..."
 
 # 1. All APIM instances, with tier, network settings and identity
 $q = @"
@@ -101,7 +108,7 @@ $apim = @(Invoke-Graph $q $subs)
 foreach ($instance in $apim) {
     if (-not $instance.id -or -not $instance.name) { throw 'Resource Graph returned an APIM instance without an ID or name.' }
 }
-$apim | Export-Csv "$out\apim-instances.csv"
+$apim | Export-Csv (Join-Path $out 'apim-instances.csv')
 
 # 1a. Scope. Microsoft's own impacted-resources list wins; otherwise Classic dedicated tiers.
 $listed = $null; $scopeSource = 'rule: Classic dedicated tiers (Developer, Basic, Standard, Premium, Isolated)' + $(if ($IncludeConsumption) { ' + Consumption' } else { '' })
@@ -200,7 +207,7 @@ $scope = foreach ($i in $apim) {
     [pscustomobject]@{ id = $i.id; name = $i.name; subscriptionId = $i.subscriptionId; sku = $i.sku; tierFamily = $dec.tierFamily; platformVersion = $i.platformVersion
                        inScope = $dec.inScope; reason = $dec.reason; scopeSource = $(if ($listed) { 'microsoft' } else { 'rule' }) }
 }
-$scope | Export-Csv "$out\scope.csv"
+$scope | Export-Csv (Join-Path $out 'scope.csv')
 $inScopeIds = @($scope | Where-Object inScope | ForEach-Object { $_.id })
 $classic = @($apim | Where-Object { $_.id -in $inScopeIds })
 $outOfScope = @($scope | Where-Object { -not $_.inScope })
@@ -241,7 +248,7 @@ $pre = foreach ($s in $subs) {
                            mismatch = $true; detail = ($err -split "`n")[0] }
     }
 }
-$pre | Export-Csv "$out\subscription-access.csv"
+$pre | Export-Csv (Join-Path $out 'subscription-access.csv')
 $bad = @($pre | Where-Object { $_.access -ne 'OK' })
 $mm = @($pre | Where-Object { $_.access -eq 'OK' -and $_.mismatch })
 Write-Host "Preflight: $(@($pre | Where-Object access -eq 'OK').Count) of $($subs.Count) subscriptions readable"
@@ -334,15 +341,15 @@ foreach ($i in $classic) {
     $instPrincipals[$i.id] = $p
     $principals.AddRange([string[]]$p)
 }
-$script:failures | Export-Csv "$out\failed-calls.csv"
+$script:failures | Export-Csv (Join-Path $out 'failed-calls.csv')
 if ($script:failures.Count) {
     Write-Warning "$($script:failures.Count) API calls failed - see failed-calls.csv (incomplete results for those instances/objects)"
     $script:failures | Where-Object { $_.url -match '/namedValues\?' } |
         ForEach-Object { Write-Warning "NAMED VALUES NOT CHECKED: $($_.url)" }
 }
-$nvRows | Export-Csv "$out\named-values.csv"
-$otherRows | Export-Csv "$out\other-secret-objects.csv"
-$subRows | Export-Csv "$out\apim-subscriptions.csv"
+$nvRows | Export-Csv (Join-Path $out 'named-values.csv')
+$otherRows | Export-Csv (Join-Path $out 'other-secret-objects.csv')
+$subRows | Export-Csv (Join-Path $out 'apim-subscriptions.csv')
 $exposed = @($nvRows | Where-Object { $_.secret -and -not $_.inKeyVault -and -not $_.loggerCredential })
 $loggerCreds = @($nvRows | Where-Object { $_.secret -and -not $_.inKeyVault -and $_.loggerCredential })
 Write-Host "Secret named values stored in APIM (not Key Vault): $($exposed.Count), plus $($loggerCreds.Count) logger credentials"
@@ -360,7 +367,7 @@ authorizationresources
 | project id, principalId = tolower(tostring(properties.principalId)), scope = tostring(properties.scope),
     roleDefinitionId = tostring(properties.roleDefinitionId)
 "@ $subs 'AtScopeAboveAndBelow' | Sort-Object id -Unique)
-    $rbac | Export-Csv "$out\identity-role-assignments.csv"
+    $rbac | Export-Csv (Join-Path $out 'identity-role-assignments.csv')
 
     $vaults = @(Invoke-Graph @"
 resources
@@ -370,7 +377,7 @@ resources
 | project id, vault = name, subscriptionId, objectId = tolower(tostring(ap.objectId)),
     secrets = tostring(ap.permissions.secrets), keys = tostring(ap.permissions.keys)
 "@ $subs)
-    $vaults | Export-Csv "$out\identity-keyvault-access-policies.csv"
+    $vaults | Export-Csv (Join-Path $out 'identity-keyvault-access-policies.csv')
     Write-Host "Role assignments: $($rbac.Count); Key Vault access-policy entries: $($vaults.Count)"
 }
 # 4. One-line verdict per in-scope instance (also saved to summary.csv, followed by the out-of-scope instances)
@@ -427,7 +434,7 @@ $summary = @($summary) + @(foreach ($o in $outOfScope) {
     }
 })
 foreach ($o in $outOfScope) { Write-Host ("{0,-38} {1} {2} ({3})" -f (Get-StatusLabel 'OUT OF SCOPE' $o.tierFamily $o.platformVersion), $o.name, $o.sku, $o.reason) -ForegroundColor DarkGray }
-$summary | Export-Csv "$out\summary.csv"
+$summary | Export-Csv (Join-Path $out 'summary.csv')
 Write-Host @"
 Legend: LIKELY EXPOSED = no VNet/private endpoint and/or secrets held by APIM (matches Microsoft's conditions). Secrets held
                  by APIM means secret named values not in Key Vault, certificates uploaded directly, or identity provider /

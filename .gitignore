@@ -2,6 +2,7 @@
 apim-exposure/
 kv-audit/
 incident-analysis/
+ingress-exposure/
 *.csv
 *.json
 # Archives and spreadsheets of the output (e.g. zipped results to send to someone)

@@ -94,3 +94,15 @@ The reporting clocks usually start when the organisation becomes aware of the in
 
 ### Ongoing
 - [ ] Keep the incident log current, especially once unexplained activity has been identified or ruled out
+
+## 4. Lock down internet ingress
+
+From `Check-IngressExposure.ps1` (`ingress-report.md`). Microsoft's own list is the "Network security" section of *Secure your Azure API Management deployment*.
+
+- [ ] Management endpoint (port 3443) reachable from the internet or from broad ranges: restrict the NSG rule on the APIM subnet to the `ApiManagement` service tag; without VNet injection, use a private endpoint with public network access disabled or move to internal mode
+- [ ] Gateway, developer portal, Git and management hostnames open with no front end: internal mode or a private endpoint if the APIs are private; otherwise a WAF in prevention mode plus an `X-Azure-FDID` check-header, an `ip-filter` policy or an NSG allow for the front end only, so the WAF cannot be bypassed
+- [ ] WAF in detection mode or disabled: switch to prevention after reviewing the log
+- [ ] Custom WAF allow rules for wide ranges, disabled managed rules and broad exclusions: narrow them
+- [ ] NSG allow rules on the APIM subnet for ports other than 80, 443, 3443 and 6390: remove them
+- [ ] Direct management API and Git access: disable unless used, regenerate the keys either way
+- [ ] Confirm the gateway patch level (`-CheckGatewayPatch`; NSM thresholds 0.52.31936 / 0.53.31938) and contact Microsoft if an instance is still below it

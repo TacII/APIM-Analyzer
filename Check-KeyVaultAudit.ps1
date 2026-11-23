@@ -16,7 +16,8 @@ param(
     [datetime]$WindowEnd   = '2026-11-21',   # UTC, exclusive
     [ValidateRange('Positive')][int]$LookbackDays = 90, # how far back to read logs (baseline = everything before WindowStart)
     [string]$ScopeFile = (Join-Path $PWD 'apim-exposure\scope.csv'),   # from Check-ApimExposure.ps1, if present
-    [switch]$IncludeConsumption              # without a scope file: treat Consumption instances as in scope too
+    [switch]$IncludeConsumption,             # without a scope file: treat Consumption instances as in scope too
+    [string]$TenantId                        # Entra tenant to read; default: the tenant of the current az account (subscriptions in other tenants are skipped)
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Apim-Helpers.ps1')
@@ -30,7 +31,9 @@ New-Item -ItemType Directory -Force $OutDir | Out-Null
 $script:armToken = $null
 function Get-ArmToken {
     if (-not $script:armToken -or $script:armToken.expires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
-        $t = Invoke-AzJson @('account', 'get-access-token', '--resource', 'https://management.azure.com/')
+        $azArgs = @('account', 'get-access-token', '--resource', 'https://management.azure.com/')
+        if ($script:tenantId) { $azArgs += @('--tenant', $script:tenantId) }
+        $t = Invoke-AzJson $azArgs
         if (-not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
         $exp = if ($t.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$t.expires_on) } else { [DateTimeOffset]::new([datetime]$t.expiresOn) }
         $script:armToken = @{ value = $t.accessToken; expires = $exp }
@@ -92,8 +95,11 @@ function Get-Ips($v) {
 }
 
 # ---- 1. APIM Classic instances and their managed identities -------------------------------------
-$subs = @(Get-EnabledSubscription)
-Write-Host "Subscriptions: $($subs.Count)"
+# One tenant per run (Get-EnabledSubscription in Apim-Helpers.ps1): only that tenant's enabled subscriptions are read and
+# the rest are listed and skipped. Pass -TenantId <id> after `az login --tenant <id>` to read another tenant.
+$script:tenantId = Get-AzTenantId $TenantId
+$subs = @(Get-EnabledSubscription -TenantId $script:tenantId)
+Write-Host "Tenant $($script:tenantId): $($subs.Count) subscription(s)"
 $allApim = @(Invoke-Graph "resources | where type =~ 'microsoft.apimanagement/service' | project id, name, subscriptionId, sku = tostring(sku.name), publicIPs = properties.publicIPAddresses, privateIPs = properties.privateIPAddresses, additionalLocations = properties.additionalLocations, identity" $subs)
 # Scope: the scope file from Check-ApimExposure.ps1 (which uses Microsoft's impacted-resources list when it can),
 # otherwise Classic dedicated tiers. Listed v2 instances remain in scope to cover possible migrations.
@@ -221,7 +227,7 @@ foreach ($r in $rbac) {
                                         reason = 'no Key Vault data access and no way to grant it' }
     }
 }
-$excluded | Export-Csv "$OutDir\excluded-role-assignments.csv"
+$excluded | Export-Csv (Join-Path $OutDir 'excluded-role-assignments.csv')
 Write-Host "Candidate vaults (reachable by an APIM identity as far as you can see): $($cand.Count); role assignments excluded as not granting vault access: $($excluded.Count)"
 if (-not $cand.Count) { Write-Warning 'No candidate vaults found. This may just mean you cannot see the role assignments; ask a tenant admin.'; return }
 
@@ -256,7 +262,7 @@ $logging = foreach ($k in $cand.Keys) {
         workspaceId = $ws; note = $note
     }
 }
-$logging | Export-Csv "$OutDir\vault-logging.csv"
+$logging | Export-Csv (Join-Path $OutDir 'vault-logging.csv')
 
 # ---- 4. Query the logs --------------------------------------------------------------------------
 function Invoke-La([string]$ws, [string]$kql) {
@@ -346,9 +352,9 @@ foreach ($row in $pact) {
     Add-Member -InputObject $row -NotePropertyName Flag -NotePropertyValue $flag -Force
     Add-Member -InputObject $row -NotePropertyName Apim -NotePropertyValue (($apis | ForEach-Object { $_.name }) -join ',') -Force
 }
-$cov | Export-Csv "$OutDir\log-coverage.csv"
-$pact | Export-Csv "$OutDir\apim-identity-activity.csv"
-$newc | Export-Csv "$OutDir\new-callers-in-window.csv"
+$cov | Export-Csv (Join-Path $OutDir 'log-coverage.csv')
+$pact | Export-Csv (Join-Path $OutDir 'apim-identity-activity.csv')
+$newc | Export-Csv (Join-Path $OutDir 'new-callers-in-window.csv')
 
 # ---- 5. Verdict per vault -----------------------------------------------------------------------
 function Get-VaultStatus([string]$WorkspaceId, [bool]$QueryFailed, $Coverage, [int]$UnexpectedIps,
@@ -388,7 +394,7 @@ $verdicts = foreach ($l in $logging) {
         newCallersInWindow = $nc.Count; note = $l.note
     }
 }
-$verdicts | Export-Csv "$OutDir\vault-verdicts.csv"
+$verdicts | Export-Csv (Join-Path $OutDir 'vault-verdicts.csv')
 
 Write-Host "`n=== Per-vault verdicts (window $ws0 to $we0 UTC, lookback $LookbackDays days) ==="
 foreach ($v in ($verdicts | Sort-Object status, vault)) {
