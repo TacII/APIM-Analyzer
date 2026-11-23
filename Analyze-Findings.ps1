@@ -28,14 +28,31 @@ param(
     [string]$OutDir      = (Join-Path $PWD 'incident-analysis'),
     [datetime]$WindowStart = '2026-11-16',   # UTC, inclusive - use the same values as Check-KeyVaultAudit.ps1
     [datetime]$WindowEnd   = '2026-11-21',   # UTC, exclusive
-    [int]$LookbackDays = 90,
+    [ValidateRange('Positive')][int]$LookbackDays = 90,
     [string]$CompareTo,                      # previous OutDir; its snapshot.json is compared with this run
-    [switch]$SkipLive                        # only use the CSVs: no Entra, Log Analytics or ARM calls
+    [switch]$SkipLive,                       # only use the CSVs: no Entra, Log Analytics or ARM calls
+    [switch]$IncludeConsumption              # fallback only, when scope.csv has no decision for an instance
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Apim-Helpers.ps1')
+$WindowStart = ConvertTo-UtcDate $WindowStart
+$WindowEnd = ConvertTo-UtcDate $WindowEnd
+Assert-AuditWindow $WindowStart $WindowEnd $LookbackDays
 New-Item -ItemType Directory -Force $OutDir | Out-Null
-function Read-Csv([string]$Path) { if (Test-Path $Path) { @(Import-Csv $Path) } else { Write-Warning "Not found: $Path"; @() } }
-function Test-True($v) { "$v" -eq 'True' }
+function Read-Csv([string]$Path, [string[]]$Columns = @(), [switch]$Required) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        if ($Required) { throw "Required input not found: $Path. Run Check-ApimExposure.ps1 first." }
+        Write-Warning "Not found: $Path"; return
+    }
+    $rows = @(Import-Csv -LiteralPath $Path)
+    if ($rows.Count) {
+        foreach ($column in $Columns) {
+            if ($rows[0].PSObject.Properties.Name -notcontains $column) { throw "Missing column '$column' in $Path." }
+        }
+    }
+    $rows
+}
+function Test-True($v) { ConvertTo-ReportBoolean $v 'analysis CSV boolean' }
 # make_set values from Log Analytics come back as JSON text from this API version
 function Expand-Ops($v) { if ($v -is [string]) { if (-not $v) { return @() }; try { @($v | ConvertFrom-Json) } catch { @($v) } } else { @($v) } }
 
@@ -45,8 +62,8 @@ function Get-Token([string]$Resource) {
     $t = $script:tokens[$Resource]
     if (-not $t -or $t.expires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
         $azArgs = if ($Resource -eq 'graph') { @('--resource-type', 'ms-graph') } else { @('--resource', 'https://management.azure.com/') }
-        $r = az account get-access-token @azArgs -o json | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0 -or -not $r.accessToken) { throw "Could not get a $Resource token. Run az login." }
+        $r = Invoke-AzJson (@('account', 'get-access-token') + $azArgs)
+        if (-not $r.accessToken) { throw "Could not get a $Resource token. Run az login." }
         $exp = if ($r.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$r.expires_on) } else { [DateTimeOffset]::new([datetime]$r.expiresOn) }
         $t = @{ value = $r.accessToken; expires = $exp }; $script:tokens[$Resource] = $t
     }
@@ -58,7 +75,7 @@ function Invoke-Api([string]$Method, [string]$Url, $Body, [string]$Resource = 'a
         if ($null -ne $Body) { $p.Body = ($Body | ConvertTo-Json -Depth 10 -Compress); $p.ContentType = 'application/json' }
         try { return [pscustomobject]@{ ok = $true; data = (Invoke-RestMethod @p) } }
         catch {
-            $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+            $code = if ($null -ne $_.Exception.Response.StatusCode) { [int]$_.Exception.Response.StatusCode } else { 0 }
             if ($try -lt 4 -and ($code -eq 429 -or $code -ge 500)) { Start-Sleep -Seconds ([Math]::Pow(2, $try)); continue }
             $msg = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
             return [pscustomobject]@{ ok = $false; error = "HTTP $code $msg" }
@@ -66,13 +83,21 @@ function Invoke-Api([string]$Method, [string]$Url, $Body, [string]$Resource = 'a
     }
 }
 function Get-AllPages([string]$Url) {
-    while ($Url) { $r = Invoke-Api GET $Url; if (-not $r.ok) { return }; $r.data.value; $Url = $r.data.nextLink }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    while ($Url) {
+        if (-not $seen.Add($Url)) { throw "Repeated nextLink while enumerating ${Url}; paging aborted." }
+        $r = Invoke-Api GET $Url
+        if (-not $r.ok) { throw "Could not enumerate ${Url}: $($r.error)" }
+        Assert-ResponseCollection $r.data 'value' $Url
+        $r.data.value
+        $Url = $r.data.nextLink
+    }
 }
 
 # ---- Heuristics ------------------------------------------------------------------------------------------
 # Environment from a resource or secret name. Names without any marker are assumed to be production.
 function Get-Env([string]$Name) {
-    $n = "$Name".ToLower()
+    $n = "$Name".ToLowerInvariant()
     if ($n -match '(^|[-_.])(prod|prd|production|live)([-_.]|$)') { return 'prod' }
     if ($n -match '(^|[-_.])(dev|utv|development|sandbox|sbx)([-_.]|$)' -or $n -match 'dev$') { return 'dev' }
     if ($n -match '(^|[-_.])(test|tst|qa|uat|stage|staging|stg|preprod|acc|at|ft|st|xt|it)([-_.]|$)' -or $n -match 'test$') { return 'test' }
@@ -104,17 +129,14 @@ $noiseFailOps = @('CertificateContactsGet')
 # =====================================================================================================
 # 1. Secrets held by APIM
 # =====================================================================================================
-$instances = Read-Csv (Join-Path $ExposureDir 'apim-instances.csv')
-$summary   = Read-Csv (Join-Path $ExposureDir 'summary.csv')
-$nv        = Read-Csv (Join-Path $ExposureDir 'named-values.csv')
-$subsCsv   = Read-Csv (Join-Path $ExposureDir 'apim-subscriptions.csv')
-$scopeCsv  = Read-Csv (Join-Path $ExposureDir 'scope.csv')
+$instances = @(Read-Csv (Join-Path $ExposureDir 'apim-instances.csv') @('id', 'name') -Required)
+$summary   = @(Read-Csv (Join-Path $ExposureDir 'summary.csv') -Required)
+$nv        = @(Read-Csv (Join-Path $ExposureDir 'named-values.csv') @('apim', 'secret', 'inKeyVault'))
+$subsCsv   = @(Read-Csv (Join-Path $ExposureDir 'apim-subscriptions.csv') @('apim', 'state', 'scope'))
+$scopeCsv  = @(Read-Csv (Join-Path $ExposureDir 'scope.csv'))
 # In-scope instances as decided by Check-ApimExposure.ps1 (Microsoft's list or the tier rule); older output
 # without scope.csv falls back to Classic dedicated tiers.
-$classic = if ($scopeCsv.Count) {
-    $ids = @($scopeCsv | Where-Object { $_.inScope -eq 'True' } | ForEach-Object { $_.id })
-    @($instances | Where-Object { $_.id -in $ids })
-} else { @($instances | Where-Object { $_.sku -notmatch 'V2$' -and $_.sku -ne 'Consumption' }) }
+$classic = @(Select-ApimInstance $instances (Join-Path $ExposureDir 'scope.csv') -IncludeConsumption:$IncludeConsumption)
 $envOf = @{}; foreach ($i in $classic) { $envOf[$i.name] = Get-InstanceEnv $i.name }
 Write-Host "Instances in scope: $($classic.Count) ($(@($classic | Where-Object { Test-Prod $envOf[$_.name] }).Count) production by name)"
 $scopeNames = @($classic.name)
@@ -123,7 +145,7 @@ $subsCsv = @($subsCsv | Where-Object { $_.apim -in $scopeNames })
 
 $nvRows = foreach ($v in $nv) {
     $dn = if ($v.displayName) { $v.displayName } else { $v.namedValue }
-    $logger = (Test-True $v.loggerCredential) -or $dn -like 'Logger-Credentials*'
+    $logger = ($null -ne $v.loggerCredential -and (Test-True $v.loggerCredential)) -or $dn -like 'Logger-Credentials*'
     [pscustomobject]@{
         apim = $v.apim; instanceEnv = $envOf[$v.apim]; displayName = $dn
         secret = (Test-True $v.secret); inKeyVault = (Test-True $v.inKeyVault); loggerCredential = $logger
@@ -156,18 +178,25 @@ foreach ($r in $nvRows | Where-Object { -not $_.secret -and $_.displayName -matc
 }
 
 # Subscriptions: built-in all-access (scope "/") and "all APIs" subscriptions
+foreach ($subscription in $subsCsv) {
+    if ($subscription.state -notin 'active', 'suspended', 'submitted', 'rejected', 'cancelled', 'expired') {
+        Write-Warning "$($subscription.apim)/$($subscription.apimSubscription): unknown subscription state '$($subscription.state)'; not counted as active."
+    }
+}
 $subRows = foreach ($s in $subsCsv | Where-Object { $_.state -eq 'active' }) {
     $rel = $s.scope -replace '^.*/service/[^/]+', ''
-    $kind = if ($rel -in '', '/') { 'All-access (built-in)' } elseif ($rel -match '^/apis/?$') { 'All APIs' } elseif ($rel -match '/products/') { 'Product' } elseif ($rel -match '/apis/') { 'Single API' } else { "Other ($rel)" }
+    if ([string]::IsNullOrWhiteSpace($rel)) { Write-Warning "$($s.apim)/$($s.apimSubscription): subscription scope is missing; not assuming all-access." }
+    $kind = if ($rel -eq '/') { 'All-access (built-in)' } elseif ($rel -match '^/apis/?$') { 'All APIs' } elseif ($rel -match '/products/') { 'Product' } elseif ($rel -match '/apis/') { 'Single API' } else { "Other ($rel)" }
     [pscustomobject]@{ apim = $s.apim; instanceEnv = $envOf[$s.apim]; subscription = $s.apimSubscription; displayName = $s.displayName; scopeKind = $kind }
 }
 $subRows | Export-Csv (Join-Path $OutDir 'subscription-scopes.csv')
-foreach ($r in $subRows | Where-Object { $_.scopeKind -eq 'All APIs' }) {
+foreach ($r in $subRows | Where-Object { $_.scopeKind -in 'All APIs', 'All-access (built-in)' }) {
     Add-Flag 'Subscription with access to all APIs' $r.apim "$($r.subscription) ($($r.displayName))" 'Regenerate early. Check who uses it, especially personal or tool subscriptions.'
 }
 
 # Live: backends (credential structure only, never values) and loggers (which logger credentials are referenced)
-$backendRows = @(); $loggerRows = @()
+$backendRows = [System.Collections.Generic.List[object]]::new()
+$loggerRows = [System.Collections.Generic.List[object]]::new()
 if (-not $SkipLive) {
     foreach ($i in $classic) {
         Write-Host "Backends and loggers: $($i.name)"
@@ -179,7 +208,7 @@ if (-not $SkipLive) {
             if ($c.certificate -or $c.certificateIds) { $kinds += 'clientCertificate' }
             if ($b.properties.proxy.password) { $kinds += 'proxyPassword'; $vals += $b.properties.proxy.password }
             $literal = @($vals | Where-Object { $_ -and "$_" -notmatch '^\{\{.+\}\}$' }).Count
-            $backendRows += [pscustomobject]@{ apim = $i.name; backend = $b.name; credentialKinds = ($kinds -join ','); values = $vals.Count; literalValues = $literal }
+            $backendRows.Add([pscustomobject]@{ apim = $i.name; backend = $b.name; credentialKinds = ($kinds -join ','); values = $vals.Count; literalValues = $literal })
             if ($literal) { Add-Flag 'Backend with literal credential' $i.name $b.name "$literal credential value(s) typed in directly instead of a named value. Rotate and move to a named value or Key Vault." }
         }
         $refs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase); $loggerCount = 0; $credsVisible = $false
@@ -190,8 +219,8 @@ if (-not $SkipLive) {
         }
         $creds = @($nvRows | Where-Object { $_.apim -eq $i.name -and $_.loggerCredential })
         $orphans = if ($credsVisible) { @($creds | Where-Object { -not $refs.Contains($_.displayName) }).Count } else { [Math]::Max(0, $creds.Count - $loggerCount) }
-        $loggerRows += [pscustomobject]@{ apim = $i.name; loggers = $loggerCount; loggerCredentials = $creds.Count; leftover = $orphans
-                                          method = if ($credsVisible) { 'unreferenced by any logger' } else { 'credentials minus loggers (estimate)' } }
+        $loggerRows.Add([pscustomobject]@{ apim = $i.name; loggers = $loggerCount; loggerCredentials = $creds.Count; leftover = $orphans
+                                          method = if ($credsVisible) { 'unreferenced by any logger' } else { 'credentials minus loggers (estimate)' } })
         if ($orphans -ge 5) { Add-Flag 'Leftover logger credentials' $i.name "$orphans of $($creds.Count)" 'Application Insights logger credentials that no logger uses. Low impact; clean up.' }
     }
     $backendRows | Export-Csv (Join-Path $OutDir 'backend-credentials.csv')
@@ -203,36 +232,50 @@ Write-Host "Secrets held by APIM: $($heldSecrets.Count); flags raised: $($flags.
 # =====================================================================================================
 # 2. Flagged Key Vault callers
 # =====================================================================================================
-$newCallers = Read-Csv (Join-Path $AuditDir 'new-callers-in-window.csv')
-$apimAct    = Read-Csv (Join-Path $AuditDir 'apim-identity-activity.csv')
-$logging    = Read-Csv (Join-Path $AuditDir 'vault-logging.csv')
-$verdictsIn = Read-Csv (Join-Path $AuditDir 'vault-verdicts.csv')
+$newCallers = @(Read-Csv (Join-Path $AuditDir 'new-callers-in-window.csv') @('Oid', 'ResourceId', 'CallerIP'))
+$apimAct    = @(Read-Csv (Join-Path $AuditDir 'apim-identity-activity.csv') @('Oid', 'ResourceId', 'CallerIP', 'Flag'))
+$logging    = @(Read-Csv (Join-Path $AuditDir 'vault-logging.csv') @('vaultId', 'workspaceId'))
+$verdictsIn = @(Read-Csv (Join-Path $AuditDir 'vault-verdicts.csv'))
 $flagged = @(
-    $newCallers | Where-Object { $_.Oid } | ForEach-Object { [pscustomobject]@{ oid = $_.Oid.ToLower(); vaultId = $_.ResourceId.ToLower(); ip = $_.CallerIP; source = 'new caller in window' } }
-    $apimAct | Where-Object { $_.Flag -eq 'UNEXPECTED IP' } | ForEach-Object { [pscustomobject]@{ oid = $_.Oid.ToLower(); vaultId = $_.ResourceId.ToLower(); ip = $_.CallerIP; source = 'APIM identity from unexpected IP' } }
+    $newCallers | Where-Object { $_.Oid } | ForEach-Object { [pscustomobject]@{ oid = $_.Oid.ToLowerInvariant(); vaultId = $_.ResourceId.ToLowerInvariant(); ip = $_.CallerIP; source = 'new caller in window' } }
+    $apimAct | Where-Object { $_.Flag -eq 'UNEXPECTED IP' } | ForEach-Object { [pscustomobject]@{ oid = $_.Oid.ToLowerInvariant(); vaultId = $_.ResourceId.ToLowerInvariant(); ip = $_.CallerIP; source = 'APIM identity from unexpected IP' } }
 )
 $oids = @($flagged.oid | Sort-Object -Unique)
 Write-Host "Flagged callers: $($oids.Count) identities, $($flagged.Count) caller/vault/IP combinations"
 
-$identity = @{}; $drill = @(); $ipHistory = @(); $clientHistory = @()
+$identity = @{}; $drill = @()
+$ipHistory = [System.Collections.Generic.List[object]]::new()
+$clientHistory = [System.Collections.Generic.List[object]]::new()
 if ($oids.Count -and -not $SkipLive) {
     # Resolve identities in Entra ID
     for ($k = 0; $k -lt $oids.Count; $k += 1000) {
         $chunk = @($oids[$k..([Math]::Min($k + 999, $oids.Count - 1))])
         $r = Invoke-Api POST 'https://graph.microsoft.com/v1.0/directoryObjects/getByIds' @{ ids = $chunk } 'graph'
         if ($r.ok) {
+            Assert-ResponseCollection $r.data 'value' 'Entra ID directoryObjects/getByIds'
             foreach ($o in $r.data.value) {
-                $type = switch ($o.'@odata.type') { '#microsoft.graph.user' { 'user' } '#microsoft.graph.servicePrincipal' { if ($o.servicePrincipalType -eq 'ManagedIdentity') { 'managedIdentity' } else { 'servicePrincipal' } } default { $o.'@odata.type' } }
-                $identity[$o.id.ToLower()] = [pscustomobject]@{ type = $type; name = $o.displayName; upn = $o.userPrincipalName; appId = $o.appId
+                if (-not $o.id) { throw 'Entra ID returned a directory object without an ID.' }
+                $type = switch ($o.'@odata.type') { '#microsoft.graph.user' { 'user' } '#microsoft.graph.servicePrincipal' { if ($o.servicePrincipalType -eq 'ManagedIdentity') { 'managedIdentity' } else { 'servicePrincipal' } } default {
+                    Write-Warning "Directory object $($o.id) has an unrecognized type '$($o.'@odata.type')'."
+                    'UNKNOWN'
+                } }
+                $identity[$o.id.ToLowerInvariant()] = [pscustomobject]@{ type = $type; name = $o.displayName; upn = $o.userPrincipalName; appId = $o.appId
                     resource = (@($o.alternativeNames) | Where-Object { $_ -like '/subscriptions/*' }) -join ' ' }
             }
-        } else { Write-Warning "Entra ID lookup failed (needs directory read access): $($r.error)" }
+        } else {
+            Write-Warning "Entra ID lookup failed (needs directory read access): $($r.error)"
+            foreach ($oid in $chunk) {
+                $identity[$oid] = [pscustomobject]@{ type = 'LOOKUP FAILED'; name = '(directory lookup failed)'; upn = ''; appId = ''; resource = '' }
+            }
+        }
     }
     foreach ($o in $oids) { if (-not $identity.ContainsKey($o)) { $identity[$o] = [pscustomobject]@{ type = 'NOT FOUND'; name = '(not in directory: deleted, other tenant, or no read access)'; upn = ''; appId = ''; resource = '' } } }
 
     # Azure public IP ranges (service tag AzureCloud), to tell cloud-hosted callers from others
     $azureNets = @()
-    $sub = az account show --query id -o tsv 2>$null
+    $account = Invoke-AzJson @('account', 'show')
+    if (-not $account.id) { throw 'Azure CLI account show returned no subscription ID.' }
+    $sub = $account.id
     $st = Invoke-Api GET "https://management.azure.com/subscriptions/$sub/providers/Microsoft.Network/locations/westeurope/serviceTags?api-version=2023-09-01"
     if ($st.ok) {
         $prefixes = @(($st.data.values | Where-Object { $_.name -eq 'AzureCloud' }).properties.addressPrefixes) | Where-Object { $_ -notmatch ':' }
@@ -246,22 +289,25 @@ if ($oids.Count -and -not $SkipLive) {
     } else { Write-Warning "Could not load Azure service tags; Azure-IP check skipped. $($st.error)" }
     function Test-AzureIp([string]$Ip) {
         if (-not $azureNets -or -not $Ip -or $Ip -match ':') { return $null }
-        try { $b = [Net.IPAddress]::Parse($Ip).GetAddressBytes() } catch { return $null }
+        try { $b = [Net.IPAddress]::Parse($Ip).GetAddressBytes() }
+        catch { Write-Warning "Invalid caller IP '$Ip'; Azure-IP classification is unknown."; return $null }
         [Array]::Reverse($b); $v = [uint64][BitConverter]::ToUInt32($b, 0)
         foreach ($n in $azureNets) { if (($v -band $n.mask) -eq $n.net) { return $true } }
         return $false
     }
 
     # Log Analytics drill-down, per workspace that holds a flagged vault
-    $wsOf = @{}; foreach ($l in $logging | Where-Object workspaceId) { $wsOf[$l.vaultId.ToLower()] = $l.workspaceId }
-    $ws0 = $WindowStart.ToString('yyyy-MM-dd'); $we0 = $WindowEnd.ToString('yyyy-MM-dd')
+    $wsOf = @{}; foreach ($l in $logging | Where-Object workspaceId) { $wsOf[$l.vaultId.ToLowerInvariant()] = $l.workspaceId }
+    $ws0 = $WindowStart.ToString('yyyy-MM-ddTHH:mm:ss.fffffff', [Globalization.CultureInfo]::InvariantCulture)
+    $we0 = $WindowEnd.ToString('yyyy-MM-ddTHH:mm:ss.fffffff', [Globalization.CultureInfo]::InvariantCulture)
     function Invoke-La([string]$Ws, [string]$Kql) {
         $r = Invoke-Api POST "https://management.azure.com$Ws/api/query?api-version=2017-01-01-preview" @{ query = $Kql; timespan = "P$($LookbackDays)D" }
         if (-not $r.ok) { throw $r.error }
-        $t = $r.data.tables[0]; $cols = @($t.columns | ForEach-Object { if ($_.name) { $_.name } else { $_.ColumnName } })
-        foreach ($row in $t.rows) { $o = [ordered]@{}; for ($c = 0; $c -lt $cols.Count; $c++) { $o[$cols[$c]] = $row[$c] }; [pscustomobject]$o }
+        ConvertFrom-LogAnalyticsResponse $r.data
     }
-    $vol = @(); $shared = @()
+    $vol = [System.Collections.Generic.List[object]]::new()
+    $shared = [System.Collections.Generic.List[object]]::new()
+    $queryErrors = @{}
     foreach ($g in ($flagged | Where-Object { $wsOf.ContainsKey($_.vaultId) } | Group-Object { $wsOf[$_.vaultId] })) {
         Write-Host "Drilling into workspace $(($g.Name -split '/')[-1])"
         $vl = (@($g.Group.vaultId | Sort-Object -Unique) | ForEach-Object { "'$_'" }) -join ','
@@ -283,11 +329,11 @@ let src = union isfuzzy=true
 
 "@
         try {
-            $ipHistory += @(Invoke-La $g.Name ($src + "src | where Oid in (oids) | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated), Failed=countif(Http in (401,403)) by Oid, ResourceId, CallerIP"))
-            $clientHistory += @(Invoke-La $g.Name ($src + "src | where Oid in (oids) | summarize Events=count(), BeforeWindow=countif(Before), InWindow=countif(InWindow), First=min(TimeGenerated), Last=max(TimeGenerated) by Oid, ResourceId, Client"))
-            $vol += @(Invoke-La $g.Name ($src + "src | where Oid in (oids) | summarize BaselineEvents=countif(Before), BaselineDays=dcountif(bin(TimeGenerated, 1d), Before), WindowEvents=countif(InWindow), WindowDays=dcountif(bin(TimeGenerated, 1d), InWindow), BaselineItems=dcountif(Item, Before and isnotempty(Item)), WindowItems=dcountif(Item, InWindow and isnotempty(Item)), WindowFailedOps=make_set_if(OperationName, InWindow and Http in (401,403)), WindowFailed=countif(InWindow and Http in (401,403)), WindowItemSample=make_set_if(Item, InWindow and isnotempty(Item), 15), FirstSeen=min(TimeGenerated) by Oid, ResourceId"))
-            if ($il) { $shared += @(Invoke-La $g.Name ($src + "src | where CallerIP in (dynamic([$il])) and isnotempty(Oid) | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated) by CallerIP, Oid")) }
-        } catch { Write-Warning "Log query failed for $($g.Name): $($_.Exception.Message)" }
+            $ipHistory.AddRange([object[]]@(Invoke-La $g.Name ($src + "src | where Oid in (oids) | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated), Failed=countif(Http in (401,403)) by Oid, ResourceId, CallerIP")))
+            $clientHistory.AddRange([object[]]@(Invoke-La $g.Name ($src + "src | where Oid in (oids) | summarize Events=count(), BeforeWindow=countif(Before), InWindow=countif(InWindow), First=min(TimeGenerated), Last=max(TimeGenerated) by Oid, ResourceId, Client")))
+            $vol.AddRange([object[]]@(Invoke-La $g.Name ($src + "src | where Oid in (oids) | summarize BaselineEvents=countif(Before), BaselineDays=dcountif(bin(TimeGenerated, 1d), Before), WindowEvents=countif(InWindow), WindowDays=dcountif(bin(TimeGenerated, 1d), InWindow), BaselineItems=dcountif(Item, Before and isnotempty(Item)), WindowItems=dcountif(Item, InWindow and isnotempty(Item)), WindowFailedOps=make_set_if(OperationName, InWindow and Http in (401,403)), WindowFailed=countif(InWindow and Http in (401,403)), WindowItemSample=make_set_if(Item, InWindow and isnotempty(Item), 15), FirstSeen=min(TimeGenerated) by Oid, ResourceId")))
+            if ($il) { $shared.AddRange([object[]]@(Invoke-La $g.Name ($src + "src | where CallerIP in (dynamic([$il])) and isnotempty(Oid) | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated) by CallerIP, Oid"))) }
+        } catch { $queryErrors[$g.Name] = $_.Exception.Message; Write-Warning "Log query failed for $($g.Name): $($_.Exception.Message)" }
     }
     $ipHistory | Export-Csv (Join-Path $OutDir 'caller-ip-history.csv')
     $clientHistory | Export-Csv (Join-Path $OutDir 'caller-clients.csv')
@@ -314,9 +360,13 @@ let src = union isfuzzy=true
         $known = $v -and [int]$v.BaselineEvents -gt 0
         $ci = @($windowClients | Where-Object { $_ -match $ciPattern }).Count -gt 0
         $apimForeign = 'APIM identity from unexpected IP' -in $f.Group.source
-        $verdict = if (-not $v) { 'NOT ANALYSED - no log data found for this caller' }
-                   elseif ($apimForeign) { 'SUSPICIOUS - APIM managed identity used from an unexpected IP' }
+        $queryFailed = $wsOf.ContainsKey($vid) -and $queryErrors.ContainsKey($wsOf[$vid])
+        $verdict = if ($apimForeign) { 'SUSPICIOUS - APIM managed identity used from an unexpected IP' }
+                   elseif ($queryFailed) { 'NOT ANALYSED - log queries failed or returned incomplete results' }
+                   elseif (-not $v) { 'NOT ANALYSED - no log data found for this caller' }
+                   elseif ($id.type -eq 'LOOKUP FAILED') { 'NOT ANALYSED - directory lookup failed' }
                    elseif ($id.type -eq 'NOT FOUND') { 'SUSPICIOUS - identity not found in the directory' }
+                   elseif ($id.type -eq 'UNKNOWN') { 'INVESTIGATE - unrecognized directory object type' }
                    elseif (-not $known) { 'INVESTIGATE - identity never seen before the window' }
                    elseif ($realFails.Count) { "INVESTIGATE - failed requests in window ($($realFails -join ', '))" }
                    elseif ($newClients.Count) { 'INVESTIGATE - client (user agent) not seen before the window' }
@@ -348,7 +398,8 @@ let src = union isfuzzy=true
 # 3. Snapshot, comparison and report
 # =====================================================================================================
 $snapshot = [ordered]@{
-    generated = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); window = "$($WindowStart.ToString('yyyy-MM-dd'))/$($WindowEnd.ToString('yyyy-MM-dd'))"
+    generated = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    window = "$($WindowStart.ToString('o'))/$($WindowEnd.ToString('o'))"
     instances = @($summary | ForEach-Object { [ordered]@{ apim = $_.apim; status = $_.status; secretsInApim = $_.secretsInApim; activeSubscriptions = $_.activeSubscriptions } })
     heldSecrets = $heldSecrets.Count; activeSubscriptions = @($subRows).Count
     allAccess = @($subRows | Where-Object { $_.scopeKind -like 'All*' }).Count

@@ -2,15 +2,16 @@
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 <#
 Offline tests for the scope and status decisions in Check-ApimExposure.ps1. No Azure access needed.
-The functions are loaded from the script itself, so the script stays a single standalone file.
+Shared helpers are loaded without executing either Azure scanner.
 
 Run:  Invoke-Pester ./tests
 #>
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot '..\Apim-Helpers.ps1')
     $scriptPath = Join-Path $PSScriptRoot '../Check-ApimExposure.ps1'
     $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $scriptPath), [ref]$null, [ref]$null)
-    $wanted = 'Get-ResourceName', 'Get-TierFamily', 'New-ImpactedList', 'Add-Impacted', 'Get-ScopeDecision', 'Get-InstanceStatus', 'Get-StatusLabel'
+    $wanted = 'Get-InstanceStatus', 'Get-StatusLabel', 'Get-NetworkAssessment'
     $defs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -in $wanted }, $true)
     foreach ($d in $defs) { . ([scriptblock]::Create($d.Extent.Text)) }
 
@@ -23,7 +24,7 @@ BeforeAll {
 }
 
 Describe 'Function loading' {
-    It 'finds every function under test in Check-ApimExposure.ps1' {
+    It 'loads shared scope helpers and scanner status functions' {
         foreach ($n in 'Get-ResourceName', 'Get-TierFamily', 'New-ImpactedList', 'Add-Impacted', 'Get-ScopeDecision', 'Get-InstanceStatus', 'Get-StatusLabel') {
             Get-Command $n -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty -Because "$n must exist"
         }
@@ -120,6 +121,9 @@ Describe 'Add-Impacted' {
 }
 
 Describe 'Get-InstanceStatus' {
+    It 'does not classify an unknown family as exposed or reviewed' {
+        Get-InstanceStatus -TierFamily 'Unknown' -NoNetwork -SecretsHeld | Should -Be 'UNCHECKED'
+    }
     It 'never rates a v2-tier instance LIKELY EXPOSED' {
         Get-InstanceStatus -TierFamily 'v2' -NoNetwork -SecretsHeld | Should -Be 'REVIEW (v2 tier)'
     }
@@ -134,6 +138,69 @@ Describe 'Get-InstanceStatus' {
     }
     It 'reports UNCHECKED first when objects could not be read' {
         Get-InstanceStatus -Unchecked -TierFamily 'v2' -NoNetwork | Should -Be 'UNCHECKED'
+    }
+}
+
+Describe 'Network assessment' {
+    BeforeEach {
+        $instance = [pscustomobject]@{
+            name = 'test-apim'; sku = 'Premium'; vnetType = 'None'; publicAccess = 'Enabled'
+            privateEndpointConnections = '[]'
+        }
+    }
+
+    It 'does not count pending or rejected endpoints as protection' -TestCases @(
+        @{ State = 'Pending' }, @{ State = 'Rejected' }
+    ) {
+        $instance.privateEndpointConnections = "[{`"properties`":{`"privateLinkServiceConnectionState`":{`"status`":`"$State`"}}}]"
+        $network = Get-NetworkAssessment $instance
+        $network.noNetwork | Should -BeTrue
+        $network.approvedEndpoints | Should -Be 0
+    }
+
+    It 'counts approved endpoints' {
+        $instance.privateEndpointConnections = '[{"properties":{"privateLinkServiceConnectionState":{"status":"Approved"}}}]'
+        $network = Get-NetworkAssessment $instance
+        $network.noNetwork | Should -BeFalse
+        $network.unchecked | Should -BeFalse
+        $network.approvedEndpoints | Should -Be 1
+    }
+
+    It 'recognizes VNet injection' -TestCases @(@{ Vnet = 'Internal' }, @{ Vnet = 'External' }) {
+        $instance.vnetType = $Vnet
+        (Get-NetworkAssessment $instance).noNetwork | Should -BeFalse
+    }
+
+    It 'warns about unknown network settings instead of treating them as protected' {
+        Mock Write-Warning {}
+        $instance.vnetType = 'NewMode'
+        (Get-NetworkAssessment $instance).unchecked | Should -BeTrue
+        Should -Invoke Write-Warning -Times 1 -Exactly
+    }
+
+    It 'warns about malformed endpoint metadata' {
+        Mock Write-Warning {}
+        $instance.privateEndpointConnections = '{not-json'
+        (Get-NetworkAssessment $instance).unchecked | Should -BeTrue
+        Should -Invoke Write-Warning -Times 1 -Exactly
+    }
+
+    It 'warns about unrecognized endpoint states' {
+        Mock Write-Warning {}
+        $instance.privateEndpointConnections = '[{"properties":{"privateLinkServiceConnectionState":{"status":"Unknown"}}}]'
+        (Get-NetworkAssessment $instance).unchecked | Should -BeTrue
+        Should -Invoke Write-Warning -Times 1 -Exactly
+    }
+
+    It 'does not require unsupported network features on Consumption or v2' -TestCases @(
+        @{ Sku = 'Consumption'; NoNetwork = $true }
+        @{ Sku = 'PremiumV2'; NoNetwork = $false }
+    ) {
+        $instance.sku = $Sku
+        $instance.vnetType = $null; $instance.publicAccess = $null; $instance.privateEndpointConnections = $null
+        $network = Get-NetworkAssessment $instance
+        $network.unchecked | Should -BeFalse
+        $network.noNetwork | Should -Be $NoNetwork
     }
 }
 
