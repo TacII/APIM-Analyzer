@@ -65,7 +65,7 @@ Malformed, duplicate or unrecognized `inScope` values stop the run rather than s
 | `Apim-Helpers.ps1` | Shared SKU, scope, identity, CLI, tenant and subscription selection, timestamp and response validation. Must remain alongside the entry scripts. |
 | `docs/response-checklist.md` | Generic checklist for persistence checks, rotation and reporting steps. Not legal advice. |
 | `docs/DEVLOG.md` | What changed in the scripts and why, plus open ideas. |
-| `tests/` | Offline Pester 5 tests for scope, status decisions, audit-window queries, API failure handling and the ingress rules (CIDR width, NSG priority and deny shadowing, WAF assessment, per-mode reach, policy parsing). Run `Invoke-Pester ./tests`. GitHub Actions runs them on every pull request. |
+| `tests/` | Offline Pester 5 tests for scope, status decisions, audit-window queries, API failure handling, tenant selection and the ingress rules (CIDR width, NSG priority and deny shadowing, WAF assessment, per-mode reach, policy parsing), plus offline runs of the three older scripts and an end-to-end run of the ingress script's real main flow against the synthetic tenant in `tests/fixtures/ingress-tenant.json` (nine instances across every network mode, with an Application Gateway, both Front Door kinds, Traffic Manager, Azure Firewall DNAT and a private endpoint), with only the Azure calls stubbed. Run `Invoke-Pester ./tests`. GitHub Actions runs them on every pull request. |
 
 ## Requirements
 
@@ -100,6 +100,18 @@ pwsh ./Analyze-Findings.ps1
 # later runs: compare with the previous result
 pwsh ./Analyze-Findings.ps1 -OutDir ./incident-analysis-2 -CompareTo ./incident-analysis
 ```
+
+### Running it in another tenant (for example a client's)
+
+Each run reads one tenant: the one your `az` session is signed in to. For a client tenant, sign in there first and name it:
+
+```powershell
+az login --tenant <tenant-id>
+pwsh ./Check-ApimExposure.ps1 -TenantId <tenant-id> -ImpactedResourcesCsv ./impacted-resources.csv
+pwsh ./Check-IngressExposure.ps1 -TenantId <tenant-id>
+```
+
+You need Reader on the subscriptions that hold the instances. Nothing is written to Azure. The `-CheckGatewayPatch` option is off by default because it sends one HTTPS request to each instance's public gateway hostname; leave it off when you may only read configuration. The output folders hold that tenant's resource names, IDs and addresses: keep them out of the repository and share them only with the incident team.
 
 Output goes to `./apim-exposure/`, `./ingress-exposure/`, `./kv-audit/` and `./incident-analysis/`. It contains real resource names, IDs, identities and IP addresses. **Do not commit it.** The folders, and report formats such as `.docx` and `.pdf`, are listed in `.gitignore`.
 
@@ -243,7 +255,7 @@ Two endpoints matter for this incident:
 
 ## Offline validation
 
-The regression suite covers all nine supported SKU names, unknown values, scope-file decisions, booleans, managed identities, API failures, paging, audit windows and log-response schemas. Workflow tests execute all three scripts with synthetic data and mocked CLI/HTTP calls; they do not contact Azure.
+The regression suite covers all nine supported SKU names, unknown values, scope-file decisions, booleans, managed identities, API failures, paging, audit windows and log-response schemas. Workflow tests execute the exposure, audit and analysis scripts with synthetic data and mocked CLI/HTTP calls, and an end-to-end test runs the ingress script's main flow against `tests/fixtures/ingress-tenant.json` the same way; none of them contact Azure.
 
 ```powershell
 Import-Module Pester -RequiredVersion 5.7.1

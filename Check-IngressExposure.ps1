@@ -1010,9 +1010,10 @@ foreach ($a in $apim) {
         $fp = $fd.properties
         $matchedPools = @{}
         foreach ($bp in @($fp.backendPools | Where-Object { $_ })) {
+            # Classic Front Door backends are plain objects: address and enabledState sit directly on the item
             foreach ($b in @($bp.properties.backends | Where-Object { $_ })) {
-                if ("$($b.properties.enabledState)" -eq 'Disabled') { continue }
-                $ep = Resolve-ApimTarget "$($b.properties.address)" $hosts $ips
+                if ("$($b.enabledState)" -eq 'Disabled') { continue }
+                $ep = Resolve-ApimTarget "$($b.address)" $hosts $ips
                 if ($ep) { $matchedPools["$($bp.id)".ToLower()] = $ep }
             }
         }
