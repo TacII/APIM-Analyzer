@@ -5,6 +5,8 @@ incident-analysis/
 ingress-exposure/
 *.csv
 *.json
+# Test fixtures are synthetic data and belong in the repo
+!tests/fixtures/*.json
 # Archives and spreadsheets of the output (e.g. zipped results to send to someone)
 *.zip
 *.7z
