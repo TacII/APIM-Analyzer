@@ -235,3 +235,44 @@ Describe 'Audit window validation' {
         Should -Invoke Write-Warning -Times 1 -Exactly
     }
 }
+
+Describe 'Tenant selection' {
+    BeforeEach { $previousExitCode = $global:LASTEXITCODE }
+    AfterEach { $global:LASTEXITCODE = $previousExitCode }
+
+    It 'returns only the named tenant''s enabled subscriptions and reports the ones it skips' {
+        Mock Write-Host {}
+        Mock az { $global:LASTEXITCODE = 0; '[{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","state":"Enabled","tenantId":"11111111-1111-1111-1111-111111111111"},{"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","state":"Enabled","tenantId":"22222222-2222-2222-2222-222222222222"},{"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","state":"Disabled","tenantId":"11111111-1111-1111-1111-111111111111"}]' }
+        @(Get-EnabledSubscription -TenantId '22222222-2222-2222-2222-222222222222') | Should -Be @('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -like 'Skipping 1 subscription(s) in 1 other tenant(s): 11111111-1111-1111-1111-111111111111 (1).*' }
+    }
+
+    It 'matches the tenant ID regardless of case and surrounding whitespace' {
+        Mock az { $global:LASTEXITCODE = 0; '[{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","state":"Enabled","tenantId":"ABCDABCD-1111-1111-1111-111111111111"}]' }
+        @(Get-EnabledSubscription -TenantId (Get-AzTenantId ' abcdabcd-1111-1111-1111-111111111111 ')) | Should -Be @('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
+    }
+
+    It 'never returns the placeholder entry of a tenant without subscriptions' {
+        Mock Write-Host {}
+        Mock az { $global:LASTEXITCODE = 0; '[{"id":"33333333-3333-3333-3333-333333333333","name":"N/A(tenant level account)","state":"Enabled","tenantId":"33333333-3333-3333-3333-333333333333"},{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","state":"Enabled","tenantId":"11111111-1111-1111-1111-111111111111"}]' }
+        @(Get-EnabledSubscription) | Should -Be @('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
+        { Get-EnabledSubscription -TenantId '33333333-3333-3333-3333-333333333333' } | Should -Throw '*No enabled subscriptions in tenant 33333333-3333-3333-3333-333333333333*'
+    }
+
+    It 'uses a given tenant ID without calling Azure CLI' {
+        Mock az { throw 'Azure CLI must not be called' }
+        Get-AzTenantId '11111111-1111-1111-1111-111111111111' | Should -Be '11111111-1111-1111-1111-111111111111'
+        Should -Invoke az -Times 0 -Exactly
+    }
+
+    It 'reads the current tenant from the signed-in account' {
+        Mock az { $global:LASTEXITCODE = 0; '{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","tenantId":"11111111-1111-1111-1111-111111111111"}' }
+        Get-AzTenantId | Should -Be '11111111-1111-1111-1111-111111111111'
+        Should -Invoke az -Times 1 -Exactly
+    }
+
+    It 'fails clearly when the signed-in account has no tenant' {
+        Mock az { $global:LASTEXITCODE = 0; '{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}' }
+        { Get-AzTenantId } | Should -Throw '*Could not determine the current tenant*'
+    }
+}

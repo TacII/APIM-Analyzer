@@ -15,6 +15,8 @@ Potentially exposed items include named-value secrets, identity provider and Ope
 
 Because the exact reach of the issue is not fully documented, these tools also look at Key Vaults that APIM managed identities can reach. That is a precaution, not a confirmed attack path.
 
+Public context, as of 22 November 2026: Microsoft has published no advisory beyond the customer notice. Norway's National Security Authority (NSM) published an advisory on 20 November 2026 after attacks on Equinor and Skagerak Energi that exploited the issue; it says to assume all secrets and named values are compromised, and gives a way to check the gateway's patch level (see `-CheckGatewayPatch` below). Microsoft's Tech Community post *Rotating credentials in Azure API Management* (21 November 2026) lists the rotation endpoints. The "Network security" section the notice refers to matches Microsoft's *Secure your Azure API Management deployment* page: private endpoint plus disabled public network access, VNet injection (internal mode preferred), a WAF in front of an internal instance, and IP filtering.
+
 ### Which instances are in scope
 
 **Microsoft's own list is authoritative.** In the Azure portal, open Service Health > Security advisories, select the advisory, and go to **Impacted Resources**. Use **Export to CSV** and pass the file to the exposure script:
@@ -30,7 +32,7 @@ Without that list, the script falls back to a rule: **Classic dedicated tiers** 
 - **Consumption** (multi-tenant platform `mtv1`) is out of scope by default. Microsoft's notice names it among the Classic tiers, but in the tenants checked so far Microsoft's impacted-resources list included only dedicated-tier instances. Add `-IncludeConsumption` to include it anyway.
 - **Platform version** is shown but not used. Instances on `stv2.1` were listed as impacted.
 
-All three scripts share these explicit SKU rules in `Apim-Helpers.ps1`:
+All four analysis scripts share these explicit SKU rules in `Apim-Helpers.ps1`:
 
 | SKU | Family | Fallback scope |
 |---|---|---|
@@ -47,9 +49,9 @@ SKU matching ignores case and surrounding whitespace. The supported names follow
 
 **A v2 instance on Microsoft's list.** If Microsoft lists an instance that is now a v2 tier, it was probably migrated from Classic after the incident. It stays in scope, because its secrets may have been exposed while it was Classic, but it is rated `REVIEW (v2 tier)` and never `LIKELY EXPOSED`. The script prints a warning for it.
 
-The decision per instance is written to `apim-exposure/scope.csv`. The audit and analysis scripts use that file when it exists, so all three scripts work on the same set.
+The decision per instance is written to `apim-exposure/scope.csv`. The audit, ingress and analysis scripts use that file when it exists, so all four scripts work on the same set.
 
-Malformed, duplicate or unrecognized `inScope` values stop the run rather than silently excluding resources. If a current instance is missing from an older scope file, the scripts warn and apply the tier fallback to that instance. Regenerate the scope file to reconcile new or removed resources. `-IncludeConsumption` is available on all three scripts and only affects the fallback, not an explicit scope-file decision.
+Malformed, duplicate or unrecognized `inScope` values stop the run rather than silently excluding resources. If a current instance is missing from an older scope file, the scripts warn and apply the tier fallback to that instance. Regenerate the scope file to reconcile new or removed resources. `-IncludeConsumption` is available on all four scripts and only affects the fallback, not an explicit scope-file decision.
 
 ## What is in this repo
 
@@ -57,23 +59,25 @@ Malformed, duplicate or unrecognized `inScope` values stop the run rather than s
 |---|---|
 | `Check-ApimExposure.ps1` | Finds APIM instances across all subscriptions you can read, flags Classic tiers, and checks network settings. Lists named values, certificates, identity providers and other secret-bearing objects, APIM subscriptions, and whether the direct management API and Git access are enabled. Also maps what each instance's managed identity can reach. |
 | `Check-KeyVaultAudit.ps1` | Can run without the exposure scan. Finds the vaults that APIM managed identities can read from, or can grant themselves access to. Checks whether audit logging is enabled, and queries Log Analytics for identity activity and new callers in a time window. |
-| `Analyze-Findings.ps1` | Follow-up analysis of the two scripts' output. Classifies the secrets held by APIM and flags environment mixing, reused secret names, all-access subscriptions, leftover logger credentials and literal backend credentials. Resolves flagged Key Vault callers in Entra ID, drills into their log history and gives each a heuristic verdict. Writes a Markdown report and can compare with a previous run. |
+| `Check-IngressExposure.ps1` | Maps every internet ingress pathway to the in-scope instances and rates how permissive it is: the instance's own network mode, the NSG on the APIM subnet (open or broad allows on 3443 and 443), Application Gateway and Front Door WAF policies (disabled, detection-only, permissive custom rules, bypassable), Traffic Manager, Azure Firewall DNAT rules and private endpoints. Optionally checks the gateway's patch level. Writes CSVs and `ingress-report.md`. |
+| `Analyze-Findings.ps1` | Follow-up analysis of the exposure and audit scripts' output, plus the ingress summary when present. Classifies the secrets held by APIM and flags environment mixing, reused secret names, all-access subscriptions, leftover logger credentials and literal backend credentials. Resolves flagged Key Vault callers in Entra ID, drills into their log history and gives each a heuristic verdict. Writes a Markdown report and can compare with a previous run. |
 | `Rotate-ApimCredential.ps1` | Opt-in, one-at-a-time subscription and legacy management key regeneration, APIM secret named-value updates, and Key Vault named-value refreshes. Requires a matching in-scope exposure scan and confirmation. |
-| `Apim-Helpers.ps1` | Shared SKU, scope, identity, CLI, timestamp and response validation. Must remain alongside the entry scripts. |
+| `Apim-Helpers.ps1` | Shared SKU, scope, identity, CLI, tenant and subscription selection, timestamp and response validation. Must remain alongside the entry scripts. |
 | `docs/response-checklist.md` | Generic checklist for persistence checks, rotation and reporting steps. Not legal advice. |
 | `docs/DEVLOG.md` | What changed in the scripts and why, plus open ideas. |
-| `tests/` | Offline Pester 5 tests for scope, status decisions, audit-window queries and API failure handling (`Invoke-Pester ./tests`). GitHub Actions runs them on every pull request. |
+| `tests/` | Offline Pester 5 tests for scope, status decisions, audit-window queries, API failure handling, tenant selection and the ingress rules (CIDR width, NSG priority and deny shadowing, WAF assessment, per-mode reach, policy parsing), plus offline runs of the three older scripts and an end-to-end run of the ingress script's real main flow against the synthetic tenant in `tests/fixtures/ingress-tenant.json` (nine instances across every network mode, with an Application Gateway, both Front Door kinds, Traffic Manager, Azure Firewall DNAT and a private endpoint), with only the Azure calls stubbed. Run `Invoke-Pester ./tests`. GitHub Actions runs them on every pull request. |
 
 ## Requirements
 
 - PowerShell 7+
 - Keep `Apim-Helpers.ps1` alongside the entry scripts; clone/download the repository rather than copying one script alone
 - Azure CLI (`az`), signed in with `az login`
-- **Reader** on the subscriptions you want to cover
+- **Reader** on the subscriptions you want to cover (the ingress script also reads NSGs, gateways, Front Doors, firewalls and the APIM global policy, all covered by Reader)
+- One tenant per run: the scripts read the enabled subscriptions of the current `az` tenant and say how many subscriptions they skip in each other tenant. For another tenant, run `az login --tenant <id>` and pass `-TenantId <id>`
 - For the audit script: **Log Analytics Reader** on the workspaces that hold Key Vault logs
 - For the follow-up analysis: also directory read access in Entra ID, to resolve object IDs
 
-The three analysis scripts are read-only. **The separate rotation script changes Azure resources** and requires suitable write/action permissions in addition to Reader.
+The four analysis scripts are read-only. **The separate rotation script changes Azure resources** and requires suitable write/action permissions in addition to Reader.
 
 ## Usage
 
@@ -82,6 +86,10 @@ az login
 
 # 1. Find Classic instances, network settings and secrets stored in APIM
 pwsh ./Check-ApimExposure.ps1
+
+# 1b. Who on the internet can reach the in-scope instances, through what, and how permissive is each path
+pwsh ./Check-IngressExposure.ps1
+# options: -TightPrefixLength 25 (treat /25 and smaller as tight; default 24), -AllInstances, -CheckGatewayPatch, -SkipPolicy
 
 # 2. Review Key Vault audit logs for the incident window
 pwsh ./Check-KeyVaultAudit.ps1
@@ -93,7 +101,19 @@ pwsh ./Analyze-Findings.ps1
 pwsh ./Analyze-Findings.ps1 -OutDir ./incident-analysis-2 -CompareTo ./incident-analysis
 ```
 
-Output goes to `./apim-exposure/`, `./kv-audit/` and `./incident-analysis/`. It contains real resource names, IDs, identities and IP addresses. **Do not commit it.** The folders, and report formats such as `.docx` and `.pdf`, are listed in `.gitignore`.
+### Running it in another tenant (for example a client's)
+
+Each run reads one tenant: the one your `az` session is signed in to. For a client tenant, sign in there first and name it:
+
+```powershell
+az login --tenant <tenant-id>
+pwsh ./Check-ApimExposure.ps1 -TenantId <tenant-id> -ImpactedResourcesCsv ./impacted-resources.csv
+pwsh ./Check-IngressExposure.ps1 -TenantId <tenant-id>
+```
+
+You need Reader on the subscriptions that hold the instances. Nothing is written to Azure. The `-CheckGatewayPatch` option is off by default because it sends one HTTPS request to each instance's public gateway hostname; leave it off when you may only read configuration. The output folders hold that tenant's resource names, IDs and addresses: keep them out of the repository and share them only with the incident team.
+
+Output goes to `./apim-exposure/`, `./ingress-exposure/`, `./kv-audit/` and `./incident-analysis/`. It contains real resource names, IDs, identities and IP addresses. **Do not commit it.** The folders, and report formats such as `.docx` and `.pdf`, are listed in `.gitignore`.
 
 Windows are UTC, with an inclusive start and exclusive end. Timestamps without a timezone are treated as UTC; local timestamps are converted to UTC. Sub-day boundaries are preserved in queries and analysis snapshots. `WindowStart` must precede `WindowEnd`, and `LookbackDays` must be positive. If the window predates the requested lookback, the scripts warn that the logs may not cover it.
 
@@ -152,7 +172,7 @@ These are indicators, not proof. A stolen credential used with the same tool wou
 - **Secret types** are inferred from display names.
 - **Backends** are checked for credential structure only. Credential values returned by the management API are inspected in memory to count literals and references; they are never printed or written out.
 
-**Comparing runs.** `-CompareTo` lists what changed since the earlier run's `snapshot.json`: instance status, vault verdicts, caller verdicts, flags and totals. Compare runs made in the same mode. A `-SkipLive` run has no backend, logger or caller data, so those show up as changes.
+**Comparing runs.** `-CompareTo` lists what changed since the earlier run's `snapshot.json`: instance status, ingress status, vault verdicts, caller verdicts, flags and totals. Compare runs made in the same mode. A `-SkipLive` run has no backend, logger or caller data, so those show up as changes.
 
 **Failed live checks.** If backend or logger enumeration fails, analysis stops with the failed URL and API error instead of treating inaccessible objects as an empty list. Resolve the error and rerun before relying on the output; files from an earlier or interrupted run may still be present.
 
@@ -185,6 +205,40 @@ These are indicators, not proof. A stolen credential used with the same tool wou
 - `DIAGNOSTIC SETTINGS FAILED` means the script could not read or interpret the logging settings; it does not mean logging was disabled. The API/schema error is retained in `vault-logging.csv` and the verdict's `note`.
 - `no anomaly found in available logs` requires the earliest and latest log timestamps to bracket the selected window, with complete caller fields. `logsFrom` and `logsTo` in `vault-verdicts.csv` expose those bounds. This is conservative: a quiet vault may receive `PARTIAL COVERAGE` even if logging was enabled. Bracketing timestamps still do not prove continuous logging or the absence of misuse.
 
+### Reading the ingress output
+
+`Check-IngressExposure.ps1` answers one question per instance: who on the internet can reach it, through what, and how permissive is each path. It uses `apim-exposure/scope.csv` when present (so it follows Microsoft's impacted-resources list), validated the same way as the audit and analysis scripts do, otherwise the shared tier rule, under which an unrecognized SKU is retained and analysed like a Classic tier; `-AllInstances` analyses everything.
+
+Two endpoints matter for this incident:
+- **The management endpoint on port 3443**: the service configuration endpoint on every Classic instance's public VIP, used by Azure's control plane (and formerly by the direct management API). Microsoft's reference NSG rule allows it only from the `ApiManagement` service tag.
+- **The 443 endpoints**: gateway, developer portal, Git and the management hostname (`*.management.azure-api.net`).
+
+**Source classes**, from most to least permissive: `OPEN` (the whole internet: `*`, `Internet`, `0.0.0.0/0`), `BROAD` (a public range wider than the tight threshold, or `AzureCloud`, which includes other customers' VMs), `AZURE-SHARED` (a multi-tenant service tag such as `AzureFrontDoor.Backend`: any tenant's Front Door), `TIGHT` (a public range at or below the threshold, default /24; set `-TightPrefixLength 25` to require /25 or smaller), `CONTROL-PLANE` (`ApiManagement`, `GatewayManager`, `AzureLoadBalancer`, `AzureTrafficManager`), `VNET` and `PRIVATE`. The address count of each range is in the CSVs, so you can sort by size regardless of the threshold.
+
+**Per-instance status** (`ingress-summary.csv`, console):
+
+| Status | Meaning |
+|---|---|
+| `OPEN` | The management endpoint or a 443 endpoint is reachable from the whole internet with nothing in front of it that blocks. A WAF in detection mode, a disabled WAF or a bypassable WAF does not count as blocking. |
+| `BROAD` | The widest unmitigated path admits a wide range, a multi-tenant service tag or an unrecognised source. |
+| `FILTERED` | Only tight ranges, or open paths that all sit behind a prevention-mode WAF that cannot be bypassed. |
+| `PRIVATE` | Nothing beyond the Azure control plane, the VNet or private ranges. |
+| `UNCHECKED` | The APIM subnet or its NSG could not be read. |
+
+`managementReach` and `gatewayReach` say where each endpoint can be reached from. `CONTROL-PLANE ONLY` on the management endpoint means only Microsoft-operated service tags are admitted; Microsoft's reference is the `ApiManagement` tag, and any other control-plane tag on 3443 is listed for review. Consumption and v2 instances have no dedicated 3443 endpoint and show `n/a` there; an instance with an unrecognized SKU is analysed as if it had one, and its `tierFamily` says `Unknown`. In VNet modes the answer comes from the NSG on the APIM subnet (every location of a multi-region instance); without a VNet it comes from `publicNetworkAccess` and the private endpoints. Whether disabling public network access also closes the developer portal, Git and management hostnames is not documented by Microsoft; the script treats it as closing them and says so.
+
+**Pathways** (`ingress-pathways.csv`, one row per way in): `direct (public VIP)`, `Application Gateway` (listener to backend pool, with the most specific WAF policy: path rule, then listener, then gateway, then the inline configuration; the gateway subnet's NSG refines the source class), `Front Door` and `Front Door (classic)` (origin or backend to route and domain, with the security policy's WAF), `Traffic Manager` (DNS only; exposure equals the target's own), `Azure Firewall DNAT` (rule sources, IP groups expanded) and `private endpoint`. `bypassable` is true when a WAF fronts the gateway but the instance also answers directly from the internet and neither checks `X-Azure-FDID` nor filters source addresses.
+
+**NSG rows** (`nsg-inbound-rules.csv`): every inbound allow rule on the APIM subnet that admits TCP traffic to 80, 443, 3443 or 6390, one row per source value, with the higher-priority deny that shadows it (`effective = False`) or partly restricts it, and an assessment against Microsoft's reference. Other ports open to wide sources are listed as `other`. Service tags are not expanded.
+
+**WAF rows** (`waf-policies.csv`, `waf-custom-rules.csv`): verdict (`PREVENTION`, `DETECTION ONLY`, `WAF DISABLED`, and `PREVENTION (no blocking rules)` or `PREVENTION (custom allow admits everyone)` for policies that block nothing; only a plain `PREVENTION` counts as mitigating), managed rule sets, disabled or weakened managed rules, exclusions, and each custom rule's assessment: an Allow for an open or broad range (`PERMISSIVE ALLOW`) or without a source restriction (`ALLOW BYPASS`) skips the managed rules; a Block with a negated address match is an `ALLOWLIST`.
+
+**Global policy** (`apim-policy-controls.csv`): an `ip-filter` allowlist and its width, and whether an `X-Azure-FDID` `check-header` exists (unconditional or inside a `choose`). Policies protect API requests at the gateway only, never the management endpoint, the developer portal or Git.
+
+**Patch level** (`-CheckGatewayPatch`, `gateway-patch-status.csv`): calls `https://<gateway>/internal-status-0123456789abcdef` on each instance's default gateway hostname and compares `RuntimeVersion` with NSM's thresholds (0.52.x patched from build 31936, 0.53.x from 31938; other patterns are v2/Consumption). Microsoft has not documented this endpoint; an unreachable or unparseable answer is `unknown`, never `patched`. Internal-mode instances are not reachable from outside their VNet.
+
+`ingress-report.md` gathers the key numbers, the per-instance table, the permissive pathways, the NSG findings, the WAF policies and what to do about each finding, with Microsoft's own guidance linked.
+
 ## Known limitations
 
 - Resource Graph hides resources you cannot read without reporting an error. The first script's preflight is meant to catch this, but it cannot see everything, for example deny assignments.
@@ -195,12 +249,13 @@ These are indicators, not proof. A stolen credential used with the same tool wou
 - Azure service-tag classification in the analysis is IPv4-only. IPv6 callers have an unknown Azure-IP classification, not a confirmed non-Azure classification.
 - Log queries read both the `AzureDiagnostics` and the resource-specific `AZKVAuditLogs` schema. The `AZKVAuditLogs` column names were checked against Microsoft's table reference. The object-ID claim layout was not verified in every workspace.
 - Access through any unlogged path will not appear in Key Vault's logs.
-- Written and tested on Windows with PowerShell 7. Behaviour elsewhere is unknown.
+- The ingress script infers reachability from configuration; it does not probe. Service tags are opaque, partial denies are reported but not subtracted, only the global policy is read, and front ends it does not know (a reverse proxy on a VM, a non-Azure CDN) are not seen.
+- `Check-ApimExposure.ps1`, `Check-KeyVaultAudit.ps1`, `Analyze-Findings.ps1` and `Rotate-ApimCredential.ps1` were written and tested on Windows with PowerShell 7. `Check-IngressExposure.ps1` was developed on macOS with PowerShell 7.7, where the whole test suite also passes.
 - Azure Resource Manager is called directly with a token from `az account get-access-token`, not through `az rest`. On Windows, `az` is a batch file that cuts URLs at `&`, which broke paging in earlier versions.
 
 ## Offline validation
 
-The regression suite covers all nine supported SKU names, unknown values, scope-file decisions, booleans, managed identities, API failures, paging, audit windows and log-response schemas. Workflow tests execute all three scripts with synthetic data and mocked CLI/HTTP calls; they do not contact Azure.
+The regression suite covers all nine supported SKU names, unknown values, scope-file decisions, booleans, managed identities, API failures, paging, audit windows and log-response schemas. Workflow tests execute the exposure, audit and analysis scripts with synthetic data and mocked CLI/HTTP calls, and an end-to-end test runs the ingress script's main flow against `tests/fixtures/ingress-tenant.json` the same way; none of them contact Azure.
 
 ```powershell
 Import-Module Pester -RequiredVersion 5.7.1

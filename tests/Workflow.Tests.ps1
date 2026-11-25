@@ -32,6 +32,7 @@ Describe 'Offline three-script workflow' {
         $previousExitCode = $global:LASTEXITCODE
         $script:subId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         $script:principal = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+        $script:tenantId = '11111111-1111-1111-1111-111111111111'
         $script:vaultId = "/subscriptions/$script:subId/resourceGroups/test/providers/Microsoft.KeyVault/vaults/test-vault"
         $script:workspaceId = "/subscriptions/$script:subId/resourceGroups/test/providers/Microsoft.OperationalInsights/workspaces/test-workspace"
         $script:inventory = @(
@@ -48,7 +49,8 @@ Describe 'Offline three-script workflow' {
             }
         )
         $global:ApimWorkflowFixture = @{
-            subId = $script:subId; principal = $script:principal
+            subId = $script:subId; principal = $script:principal; tenantId = $script:tenantId
+            accounts = @(@{ id = $script:subId; state = 'Enabled'; tenantId = $script:tenantId; isDefault = $true })
             vaultId = $script:vaultId; workspaceId = $script:workspaceId
             inventory = $script:inventory; partialLogs = $false; repeatGraphToken = $false
             directoryFailed = $false; sharedQueryFailed = $false
@@ -62,8 +64,8 @@ Describe 'Offline three-script workflow' {
             if ($Arguments -contains 'get-access-token') {
                 return (@{ accessToken = 'offline-test-token'; expires_on = [DateTimeOffset]::UtcNow.AddHours(1).ToUnixTimeSeconds() } | ConvertTo-Json -Compress)
             }
-            if ($Arguments -contains 'list') { return (@(@{ id = $global:ApimWorkflowFixture.subId; state = 'Enabled' }) | ConvertTo-Json -AsArray -Compress) }
-            if ($Arguments -contains 'show') { return (@{ id = $global:ApimWorkflowFixture.subId } | ConvertTo-Json -Compress) }
+            if ($Arguments -contains 'list') { return ($global:ApimWorkflowFixture.accounts | ConvertTo-Json -AsArray -Compress) }
+            if ($Arguments -contains 'show') { return (@{ id = $global:ApimWorkflowFixture.subId; tenantId = $global:ApimWorkflowFixture.tenantId } | ConvertTo-Json -Compress) }
             throw "Unexpected mock CLI arguments: $Arguments"
         }
         Mock Invoke-RestMethod {
@@ -270,5 +272,65 @@ Describe 'Offline three-script workflow' {
         & (Join-Path $repo 'Analyze-Findings.ps1')
         @(Import-Csv '.\incident-analysis\caller-drilldown.csv')[0].verdict |
             Should -Be 'NOT ANALYSED - log queries failed or returned incomplete results'
+    }
+
+    It 'reads one tenant per run and reports the subscriptions it skips in other tenants' {
+        $global:ApimWorkflowFixture.accounts += @(
+            @{ id = 'dddddddd-dddd-dddd-dddd-dddddddddddd'; state = 'Enabled'; tenantId = '22222222-2222-2222-2222-222222222222'; isDefault = $false }
+            @{ id = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'; state = 'Enabled'; tenantId = '22222222-2222-2222-2222-222222222222'; isDefault = $false }
+            @{ id = '22222222-2222-2222-2222-222222222222'; name = 'N/A(tenant level account)'; state = 'Enabled'; tenantId = '22222222-2222-2222-2222-222222222222'; isDefault = $false }
+        )
+        & (Join-Path $repo 'Check-ApimExposure.ps1')
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -like 'Skipping 2 subscription(s) in 1 other tenant(s): 22222222-2222-2222-2222-222222222222 (2).*' }
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq "Tenant $($global:ApimWorkflowFixture.tenantId): searching 1 subscription(s)..." }
+        Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -like '*/subscriptions/dddddddd-*' -or $Uri -like '*/subscriptions/eeeeeeee-*' -or $Uri -like '*/subscriptions/22222222-*' }
+        @(Import-Csv '.\apim-exposure\subscription-access.csv').Count | Should -Be 1
+        Should -Invoke az -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -contains '--tenant' -and $Arguments -contains '11111111-1111-1111-1111-111111111111' }
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -notcontains '--tenant' }
+    }
+
+    It 'reads the tenant named by -TenantId and requests its tokens for that tenant' {
+        $global:ApimWorkflowFixture.accounts += @(@{ id = 'dddddddd-dddd-dddd-dddd-dddddddddddd'; state = 'Enabled'; tenantId = '22222222-2222-2222-2222-222222222222'; isDefault = $false })
+        & (Join-Path $repo 'Check-KeyVaultAudit.ps1') -TenantId '22222222-2222-2222-2222-222222222222' -ScopeFile '.\missing-scope.csv'
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq 'Tenant 22222222-2222-2222-2222-222222222222: 1 subscription(s)' }
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { $Arguments -contains 'show' }
+        Should -Invoke az -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -contains '--tenant' -and $Arguments -contains '22222222-2222-2222-2222-222222222222' }
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -notcontains '--tenant' }
+    }
+
+    It 'requests analysis tokens in the tenant named by -TenantId' {
+        & (Join-Path $repo 'Check-ApimExposure.ps1')
+        Write-TestCallerInput
+        & (Join-Path $repo 'Analyze-Findings.ps1') -TenantId '22222222-2222-2222-2222-222222222222'
+        Should -Invoke az -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -contains '--tenant' -and $Arguments -contains '22222222-2222-2222-2222-222222222222' }
+    }
+
+    It 'joins the ingress summary to the analysis, flags the weak instances and compares ingress status between runs' {
+        & (Join-Path $repo 'Check-ApimExposure.ps1')
+        New-Item -ItemType Directory '.\ingress-exposure' -Force | Out-Null
+        @(
+            [pscustomobject]@{ apim = 'apim-developer'; ingressStatus = 'OPEN'; vnetType = 'Internal'; publicAccess = 'Enabled'; managementReach = 'INTERNET (NSG allows 3443 from Internet)'; gatewayReach = 'INTERNET'; wafVerdicts = 'DETECTION ONLY; PREVENTION'; wafBypassable = 'True'; ipFilter = 'none'; fdidCheck = 'False' }
+            [pscustomobject]@{ apim = 'apim-premium'; ingressStatus = 'PRIVATE'; vnetType = 'Internal'; publicAccess = 'Enabled'; managementReach = 'CONTROL-PLANE ONLY'; gatewayReach = 'PRIVATE'; wafVerdicts = 'PREVENTION'; wafBypassable = 'False'; ipFilter = 'none'; fdidCheck = 'True' }
+            [pscustomobject]@{ apim = 'apim-basicv2'; ingressStatus = 'OPEN'; vnetType = 'None'; publicAccess = 'Enabled'; managementReach = 'n/a'; gatewayReach = 'INTERNET'; wafVerdicts = ''; wafBypassable = 'False'; ipFilter = 'none'; fdidCheck = 'False' }
+        ) | Export-Csv '.\ingress-exposure\ingress-summary.csv'
+        & (Join-Path $repo 'Analyze-Findings.ps1') -SkipLive
+        $flags = @(Import-Csv '.\incident-analysis\flags.csv')
+        @($flags | Where-Object { $_.kind -eq 'Management endpoint reachable from the internet' } | ForEach-Object { $_.apim }) | Should -Be @('apim-developer')
+        @($flags | Where-Object { $_.kind -eq 'WAF bypassable or not in prevention mode' } | ForEach-Object { $_.apim }) | Should -Be @('apim-developer')
+        $report = Get-Content '.\incident-analysis\analysis-report.md' -Raw
+        $report | Should -Match '\| Instances with OPEN internet ingress \| 1 '
+        $report | Should -Match '## Internet ingress'
+        $snapshot = Get-Content '.\incident-analysis\snapshot.json' -Raw | ConvertFrom-Json
+        @($snapshot.ingress).Count | Should -Be 2   # the v2 instance is out of scope and left out
+        # Second run after locking the instance down: the comparison reports the ingress change and the resolved flags
+        (Import-Csv '.\ingress-exposure\ingress-summary.csv') | ForEach-Object {
+            if ($_.apim -eq 'apim-developer') { $_.ingressStatus = 'FILTERED'; $_.managementReach = 'CONTROL-PLANE ONLY'; $_.wafVerdicts = 'PREVENTION'; $_.wafBypassable = 'False' }
+            $_
+        } | Export-Csv '.\ingress-exposure\ingress-summary.csv'
+        & (Join-Path $repo 'Analyze-Findings.ps1') -SkipLive -OutDir '.\incident-analysis-2' -CompareTo '.\incident-analysis'
+        $report2 = Get-Content '.\incident-analysis-2\analysis-report.md' -Raw
+        $report2 | Should -Match "Ingress: apim-developer changed from 'OPEN' to 'FILTERED'"
+        $report2 | Should -Match 'Flag: resolved - Management endpoint reachable from the internet\|apim-developer'
+        $report2 | Should -Match 'Flag: resolved - WAF bypassable or not in prevention mode\|apim-developer'
     }
 }

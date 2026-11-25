@@ -11,7 +11,9 @@ What it does:
      the Key Vault logs per caller: all IP addresses over the log period, client (user agent) before and in the
      window, volume against the caller's own baseline, failed requests, and whether the IP is an Azure address.
      Each caller gets a heuristic verdict (LIKELY BENIGN / LIKELY CI/CD / INVESTIGATE / SUSPICIOUS).
-  3. Report - writes analysis-report.md plus CSVs, and a snapshot.json. With -CompareTo <previous output folder>
+  3. Internet ingress - when Check-IngressExposure.ps1 has run, its per-instance status joins the report and the
+     snapshot, and instances with an internet-reachable management endpoint or a weak WAF are flagged.
+  4. Report - writes analysis-report.md plus CSVs, and a snapshot.json. With -CompareTo <previous output folder>
      the report also lists what changed since that run.
 
 Needs: the output folders of the two scripts, Reader on the subscriptions, Log Analytics Reader on the
@@ -26,12 +28,14 @@ param(
     [string]$ExposureDir = (Join-Path $PWD 'apim-exposure'),
     [string]$AuditDir    = (Join-Path $PWD 'kv-audit'),
     [string]$OutDir      = (Join-Path $PWD 'incident-analysis'),
+    [string]$IngressDir  = (Join-Path $PWD 'ingress-exposure'),   # from Check-IngressExposure.ps1, if present
     [datetime]$WindowStart = '2026-11-16',   # UTC, inclusive - use the same values as Check-KeyVaultAudit.ps1
     [datetime]$WindowEnd   = '2026-11-21',   # UTC, exclusive
     [ValidateRange('Positive')][int]$LookbackDays = 90,
     [string]$CompareTo,                      # previous OutDir; its snapshot.json is compared with this run
     [switch]$SkipLive,                       # only use the CSVs: no Entra, Log Analytics or ARM calls
-    [switch]$IncludeConsumption              # fallback only, when scope.csv has no decision for an instance
+    [switch]$IncludeConsumption,             # fallback only, when scope.csv has no decision for an instance
+    [string]$TenantId                        # Entra tenant for the live calls; default: the tenant of the current az account
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Apim-Helpers.ps1')
@@ -62,6 +66,7 @@ function Get-Token([string]$Resource) {
     $t = $script:tokens[$Resource]
     if (-not $t -or $t.expires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
         $azArgs = if ($Resource -eq 'graph') { @('--resource-type', 'ms-graph') } else { @('--resource', 'https://management.azure.com/') }
+        if ($TenantId) { $azArgs += @('--tenant', $TenantId) }
         $r = Invoke-AzJson (@('account', 'get-access-token') + $azArgs)
         if (-not $r.accessToken) { throw "Could not get a $Resource token. Run az login." }
         $exp = if ($r.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$r.expires_on) } else { [DateTimeOffset]::new([datetime]$r.expiresOn) }
@@ -226,6 +231,19 @@ if (-not $SkipLive) {
     $backendRows | Export-Csv (Join-Path $OutDir 'backend-credentials.csv')
     $loggerRows | Export-Csv (Join-Path $OutDir 'logger-credentials.csv')
 }
+# Internet ingress (optional input from Check-IngressExposure.ps1)
+$ingressFile = Join-Path $IngressDir 'ingress-summary.csv'
+$ingress = if (Test-Path -LiteralPath $ingressFile) { @(Read-Csv $ingressFile @('apim', 'ingressStatus', 'managementReach', 'wafVerdicts', 'wafBypassable') | Where-Object { $_.apim -in $scopeNames }) } else { @() }
+if ($ingress.Count) {
+    Write-Host "Internet ingress from $ingressFile ($($ingress.Count) instances)"
+    foreach ($r in $ingress | Where-Object { $_.managementReach -like 'INTERNET*' -or $_.managementReach -like 'BROAD*' -or $_.managementReach -like 'AZURE-SHARED*' }) {
+        Add-Flag 'Management endpoint reachable from the internet' $r.apim 'service configuration endpoint (3443)' "$($r.managementReach). Restrict port 3443 to the ApiManagement service tag, or use a private endpoint with public network access disabled / internal mode."
+    }
+    # wafVerdicts is a '; '-joined set: one weak front end is enough, even next to one in prevention mode
+    foreach ($r in $ingress | Where-Object { (Test-True $_.wafBypassable) -or @("$($_.wafVerdicts)" -split ';\s*' | Where-Object { $_ -and $_ -ne 'PREVENTION' }).Count -gt 0 }) {
+        Add-Flag 'WAF bypassable or not in prevention mode' $r.apim $r.wafVerdicts "$(if (Test-True $r.wafBypassable) { 'The instance also answers directly from the internet without an X-Azure-FDID check or source filtering. ' })See ingress-pathways.csv."
+    }
+} elseif (-not (Test-Path $ingressFile)) { Write-Host "No ingress data ($ingressFile not found; run Check-IngressExposure.ps1 to include internet ingress)" }
 $flags | Export-Csv (Join-Path $OutDir 'flags.csv')
 Write-Host "Secrets held by APIM: $($heldSecrets.Count); flags raised: $($flags.Count)"
 
@@ -273,9 +291,13 @@ if ($oids.Count -and -not $SkipLive) {
 
     # Azure public IP ranges (service tag AzureCloud), to tell cloud-hosted callers from others
     $azureNets = @()
-    $account = Invoke-AzJson @('account', 'show')
-    if (-not $account.id) { throw 'Azure CLI account show returned no subscription ID.' }
-    $sub = $account.id
+    # Any readable subscription will do. An in-scope instance's subscription is in the tenant the token is for, also with -TenantId.
+    $sub = @($classic | Where-Object { $_.subscriptionId } | ForEach-Object { "$($_.subscriptionId)" })
+    $sub = if ($sub.Count) { $sub[0] } else {
+        $account = Invoke-AzJson @('account', 'show')
+        if (-not $account.id) { throw 'Azure CLI account show returned no subscription ID.' }
+        "$($account.id)"
+    }
     $st = Invoke-Api GET "https://management.azure.com/subscriptions/$sub/providers/Microsoft.Network/locations/westeurope/serviceTags?api-version=2023-09-01"
     if ($st.ok) {
         $prefixes = @(($st.data.values | Where-Object { $_.name -eq 'AzureCloud' }).properties.addressPrefixes) | Where-Object { $_ -notmatch ':' }
@@ -406,6 +428,7 @@ $snapshot = [ordered]@{
     vaults = @($verdictsIn | ForEach-Object { [ordered]@{ vault = $_.vault; status = $_.status } })
     callers = @($drill | ForEach-Object { [ordered]@{ key = "$($_.oid)|$($_.vault)"; identity = $_.identity; verdict = $_.verdict } })
     flags = @($flags | ForEach-Object { "$($_.kind)|$($_.apim)|$($_.item)" })
+    ingress = @($ingress | ForEach-Object { [ordered]@{ apim = $_.apim; status = $_.ingressStatus } })
 }
 $snapshot | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $OutDir 'snapshot.json') -Encoding utf8
 
@@ -415,14 +438,16 @@ if ($CompareTo) {
     if (Test-Path $prevFile) {
         $prev = Get-Content $prevFile -Raw | ConvertFrom-Json
         function Compare-Set($Label, $Old, $New, $KeyProp, $ValProp) {
-            $o = @{}; foreach ($x in @($Old)) { $o[$x.$KeyProp] = $x.$ValProp }
-            $n = @{}; foreach ($x in @($New)) { $n[$x.$KeyProp] = $x.$ValProp }
+            # An older snapshot may lack a set entirely (e.g. 'ingress' before 22 Nov 2026); @($null) would index with $null
+            $o = @{}; foreach ($x in @($Old | Where-Object { $_ })) { $o[$x.$KeyProp] = $x.$ValProp }
+            $n = @{}; foreach ($x in @($New | Where-Object { $_ })) { $n[$x.$KeyProp] = $x.$ValProp }
             foreach ($k in $n.Keys) { if (-not $o.ContainsKey($k)) { "$($Label): new - $k ($($n[$k]))" } elseif ("$($o[$k])" -ne "$($n[$k])") { "$($Label): $k changed from '$($o[$k])' to '$($n[$k])'" } }
             foreach ($k in $o.Keys) { if (-not $n.ContainsKey($k)) { "$($Label): no longer present - $k (was $($o[$k]))" } }
         }
         $changes += Compare-Set 'Instance' $prev.instances $snapshot.instances 'apim' 'status'
         $changes += Compare-Set 'Secrets in APIM' $prev.instances $snapshot.instances 'apim' 'secretsInApim'
         $changes += Compare-Set 'Vault' $prev.vaults $snapshot.vaults 'vault' 'status'
+        $changes += Compare-Set 'Ingress' $prev.ingress $snapshot.ingress 'apim' 'status'
         $changes += Compare-Set 'Caller' $prev.callers $snapshot.callers 'key' 'verdict'
         foreach ($fl in @($snapshot.flags) | Where-Object { $_ -notin @($prev.flags) }) { $changes += "Flag: new - $fl" }
         foreach ($fl in @($prev.flags) | Where-Object { $_ -notin @($snapshot.flags) }) { $changes += "Flag: resolved - $fl" }
@@ -458,6 +483,7 @@ Generated $($snapshot.generated) by Analyze-Findings.ps1 (read-only). Window $($
 | Instances in scope | $($classic.Count) ($(@($classic | Where-Object { Test-Prod $envOf[$_.name] }).Count) production by name)$(if ($scopeCsv.Count) { "; scope source: $(@($scopeCsv.scopeSource | Sort-Object -Unique) -join ', ')" }) |
 | Instances out of scope | $(@($scopeCsv | Where-Object { $_.inScope -ne 'True' }).Count) |
 | Instances rated LIKELY EXPOSED | $(@($summary | Where-Object status -eq 'LIKELY EXPOSED').Count) |
+| Instances with OPEN internet ingress | $(if ($ingress.Count) { @($ingress | Where-Object ingressStatus -eq 'OPEN').Count } else { 'n/a (run Check-IngressExposure.ps1)' }) |
 | Secrets held by APIM (excluding logger credentials) | $($heldSecrets.Count) |
 | Active subscriptions | $(@($subRows).Count) (all-access or all-API: $($snapshot.allAccess)) |
 | Flags raised | $($flags.Count) |
@@ -472,6 +498,10 @@ $(ConvertTo-MdTable $catTable @('Category','Total','Production','Instances'))
 ## Subscriptions by scope
 
 $(ConvertTo-MdTable $subTable @('Scope','Active','Production'))
+
+## Internet ingress
+
+$(if ($ingress.Count) { "From Check-IngressExposure.ps1: who on the internet can reach each instance. OPEN = the management endpoint (3443) or a 443 endpoint is reachable from the whole internet with nothing blocking; see ingress-report.md for pathways and NSG rules.`n`n" + (ConvertTo-MdTable ($ingress | Sort-Object ingressStatus, apim) @('ingressStatus','apim','vnetType','publicAccess','managementReach','gatewayReach','wafVerdicts','wafBypassable','ipFilter','fdidCheck')) } else { '_Not available: run Check-IngressExposure.ps1 first._' })
 
 ## Flags
 

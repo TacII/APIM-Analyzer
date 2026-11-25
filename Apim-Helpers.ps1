@@ -129,20 +129,45 @@ function Invoke-AzJson([string[]]$Arguments) {
     catch { throw "Azure CLI command 'az $($Arguments -join ' ')' returned invalid JSON: $($_.Exception.Message)" }
 }
 
-function Get-EnabledSubscription {
+# One tenant per run. `az account list` spans every tenant this login has touched, but a token is valid for one
+# tenant, so the scanners read one tenant's enabled subscriptions and report the ones they skip elsewhere.
+function Get-AzTenantId([string]$TenantId) {
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) { return $TenantId.Trim() }
+    $account = Invoke-AzJson @('account', 'show')
+    if ([string]::IsNullOrWhiteSpace("$($account.tenantId)")) { throw 'Could not determine the current tenant from Azure CLI. Run az login, or pass -TenantId.' }
+    "$($account.tenantId)".Trim()
+}
+
+function Get-EnabledSubscription([string]$TenantId) {
     $accounts = Invoke-AzJson @('account', 'list')
     if ($accounts -isnot [array]) { throw 'Azure CLI account list did not return an array.' }
     $ids = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $skipped = @{}
     foreach ($account in $accounts) {
         if ($account.state -eq 'Enabled') {
             $id = [guid]::Empty
             if (-not [guid]::TryParse("$($account.id)", [ref]$id) -or $id -eq [guid]::Empty) { throw 'Enabled subscription has an invalid or missing ID.' }
+            # A tenant without subscriptions is listed as an "N/A(tenant level account)" entry whose id is the tenant id
+            if ("$($account.id)" -ieq "$($account.tenantId)") { continue }
+            if ($TenantId -and "$($account.tenantId)" -ine $TenantId) {
+                $t = if ("$($account.tenantId)") { "$($account.tenantId)" } else { '(unknown tenant)' }
+                $skipped[$t] = 1 + [int]$skipped[$t]
+                continue
+            }
             [void]$ids.Add($id.ToString())
         } elseif ($account.state -notin 'Disabled', 'Deleted', 'PastDue', 'Warned') {
             Write-Warning "Subscription '$($account.id)' has unexpected state '$($account.state)' and was not scanned."
         }
     }
-    if (-not $ids.Count) { throw 'No enabled subscriptions were returned by Azure CLI. Check az login and tenant access.' }
+    if ($skipped.Count) {
+        $total = ($skipped.Values | Measure-Object -Sum).Sum
+        $list = ($skipped.Keys | Sort-Object | ForEach-Object { "$_ ($($skipped[$_]))" }) -join ', '
+        Write-Host "Skipping $total subscription(s) in $($skipped.Count) other tenant(s): $list. Run with -TenantId <id> after 'az login --tenant <id>' to read them." -ForegroundColor DarkGray
+    }
+    if (-not $ids.Count) {
+        if ($TenantId) { throw "No enabled subscriptions in tenant $TenantId. Run az login --tenant $TenantId, or pass the right -TenantId." }
+        throw 'No enabled subscriptions were returned by Azure CLI. Check az login and tenant access.'
+    }
     $ids
 }
 
