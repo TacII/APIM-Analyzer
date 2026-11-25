@@ -1,7 +1,7 @@
 #Requires -Version 7
 <#
 Reviews Key Vault audit logs for signs that the APIM managed identities (or any other caller) read
-vault contents around the APIM incident (18-19 Nov 2026). Standalone and read-only.
+vault contents around the APIM incident (18-19 Nov 2026). Read-only; requires Apim-Helpers.ps1 alongside it.
 
 Needs: Reader on the subscriptions, and Log Analytics Reader on the workspaces that hold the vault logs.
 Run `az login` first. Output goes to .\kv-audit\
@@ -14,11 +14,15 @@ param(
     [string]$OutDir = (Join-Path $PWD 'kv-audit'),
     [datetime]$WindowStart = '2026-11-16',   # UTC, inclusive: start of the period to scrutinise
     [datetime]$WindowEnd   = '2026-11-21',   # UTC, exclusive
-    [int]$LookbackDays = 90,                 # how far back to read logs (baseline = everything before WindowStart)
-    [string]$ScopeFile = (Join-Path $PWD 'apim-exposure/scope.csv'),   # from Check-ApimExposure.ps1, if present
+    [ValidateRange('Positive')][int]$LookbackDays = 90, # how far back to read logs (baseline = everything before WindowStart)
+    [string]$ScopeFile = (Join-Path $PWD 'apim-exposure\scope.csv'),   # from Check-ApimExposure.ps1, if present
     [switch]$IncludeConsumption              # without a scope file: treat Consumption instances as in scope too
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Apim-Helpers.ps1')
+$WindowStart = ConvertTo-UtcDate $WindowStart
+$WindowEnd = ConvertTo-UtcDate $WindowEnd
+Assert-AuditWindow $WindowStart $WindowEnd $LookbackDays
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
 # ARM calls go straight to the REST API with a token from az, not through `az rest`. On Windows az is az.cmd,
@@ -26,8 +30,8 @@ New-Item -ItemType Directory -Force $OutDir | Out-Null
 $script:armToken = $null
 function Get-ArmToken {
     if (-not $script:armToken -or $script:armToken.expires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
-        $t = az account get-access-token --resource 'https://management.azure.com/' -o json | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0 -or -not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
+        $t = Invoke-AzJson @('account', 'get-access-token', '--resource', 'https://management.azure.com/')
+        if (-not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
         $exp = if ($t.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$t.expires_on) } else { [DateTimeOffset]::new([datetime]$t.expiresOn) }
         $script:armToken = @{ value = $t.accessToken; expires = $exp }
     }
@@ -40,7 +44,7 @@ function Get-Json([string]$Method, [string]$Url, $Body) {
         if ($null -ne $Body) { $p.Body = ($Body | ConvertTo-Json -Depth 10 -Compress); $p.ContentType = 'application/json' }
         try { return (Invoke-RestMethod @p) }
         catch {
-            $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+            $code = if ($null -ne $_.Exception.Response.StatusCode) { [int]$_.Exception.Response.StatusCode } else { 0 }
             if ($try -lt 4 -and ($code -eq 429 -or $code -ge 500)) { Start-Sleep -Seconds ([Math]::Pow(2, $try)); continue }
             $msg = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
             return [pscustomobject]@{ _error = "HTTP $code $msg" }
@@ -54,6 +58,7 @@ function Invoke-Graph([string]$Query, [string[]]$Subs, [string]$ScopeFilter) {
     for ($c = 0; $c -lt $Subs.Count; $c += 1000) {
         $chunk = @($Subs[$c..([Math]::Min($c + 999, $Subs.Count - 1))])
         $got = 0; $skip = $null
+        $tokens = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         do {
             $opts = [ordered]@{ '$top' = 1000; resultFormat = 'objectArray' }
             if ($skip) { $opts['$skipToken'] = $skip }
@@ -61,8 +66,12 @@ function Invoke-Graph([string]$Query, [string[]]$Subs, [string]$ScopeFilter) {
             $r = Get-Json POST 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-06-01-preview' `
                 @{ subscriptions = $chunk; query = $Query; options = $opts }
             if ($r._error) { throw "Resource Graph query failed: $($r._error)" }
+            Assert-ResponseCollection $r 'data' 'Resource Graph'
             foreach ($d in @($r.data)) { $got++; $d }
-            $skip = $r.'$skipToken'
+            $next = $r.'$skipToken'
+            if ($next -and -not $tokens.Add("$next")) { throw 'Resource Graph repeated a continuation token; paging aborted.' }
+            $skip = $next
+            if ("$($r.resultTruncated)" -eq 'true' -and -not $skip) { throw 'Resource Graph truncated results without a continuation token.' }
         } while ($skip)
         if ($r.totalRecords -gt $got) { throw "Result truncated ($got of $($r.totalRecords))." }
     }
@@ -71,7 +80,8 @@ function Invoke-Graph([string]$Query, [string[]]$Subs, [string]$ScopeFilter) {
 function Expand-Json($v) {
     if ($v -is [string]) {
         if (-not $v.Trim()) { return $null }
-        try { return $v | ConvertFrom-Json } catch { return $v }
+        try { return $v | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw "Expected valid JSON in Azure resource metadata: $($_.Exception.Message)" }
     }
     return $v
 }
@@ -82,30 +92,23 @@ function Get-Ips($v) {
 }
 
 # ---- 1. APIM Classic instances and their managed identities -------------------------------------
-$subs = @(az account list --query "[?state=='Enabled'].id" -o tsv)
+$subs = @(Get-EnabledSubscription)
 Write-Host "Subscriptions: $($subs.Count)"
-$allApim = @(Invoke-Graph "resources | where type =~ 'microsoft.apimanagement/service' | project id, name, subscriptionId, sku = tostring(sku.name), publicIPs = properties.publicIPAddresses, privateIPs = properties.privateIPAddresses, identity" $subs)
+$allApim = @(Invoke-Graph "resources | where type =~ 'microsoft.apimanagement/service' | project id, name, subscriptionId, sku = tostring(sku.name), publicIPs = properties.publicIPAddresses, privateIPs = properties.privateIPAddresses, additionalLocations = properties.additionalLocations, identity" $subs)
 # Scope: the scope file from Check-ApimExposure.ps1 (which uses Microsoft's impacted-resources list when it can),
-# otherwise Classic dedicated tiers. v2 is never in scope; Consumption only with -IncludeConsumption.
-if (Test-Path $ScopeFile) {
-    $inScope = @(Import-Csv $ScopeFile | Where-Object { $_.inScope -eq 'True' } | ForEach-Object { $_.id.ToLower() })
-    $apim = @($allApim | Where-Object { $_.id.ToLower() -in $inScope })
+# otherwise Classic dedicated tiers. Listed v2 instances remain in scope to cover possible migrations.
+$apim = @(Select-ApimInstance $allApim $ScopeFile -IncludeConsumption:$IncludeConsumption)
+if (Test-Path -LiteralPath $ScopeFile) {
     Write-Host "Scope from $ScopeFile"
 } else {
-    $apim = @($allApim | Where-Object { $_.sku -notmatch 'V2$' -and ($IncludeConsumption -or $_.sku -ne 'Consumption') })
     Write-Host "Scope: Classic dedicated tiers$(if ($IncludeConsumption) { ' + Consumption' }) (no scope file at $ScopeFile)"
 }
 Write-Host "APIM instances in scope: $($apim.Count) of $($allApim.Count)"
 
 $principalMap = @{}
 foreach ($i in $apim) {
-    $idn = Expand-Json $i.identity
-    if (-not $idn -or $idn.type -eq 'None') { continue }
-    $ids = @()
-    if ($idn.principalId) { $ids += $idn.principalId }
-    if ($idn.userAssignedIdentities) { $ids += @($idn.userAssignedIdentities.PSObject.Properties.Value | ForEach-Object { $_.principalId }) }
-    foreach ($p in ($ids | Where-Object { $_ })) {
-        $k = "$p".ToLower()
+    foreach ($p in @(Get-PrincipalIds $i.identity)) {
+        $k = $p
         if (-not $principalMap.ContainsKey($k)) { $principalMap[$k] = @() }
         $principalMap[$k] += $i
     }
@@ -116,6 +119,13 @@ $plist = ($principalMap.Keys | ForEach-Object { "'$_'" }) -join ','
 
 # ---- 2. Which vaults can those identities reach? ------------------------------------------------
 $vaults = @(Invoke-Graph "resources | where type =~ 'microsoft.keyvault/vaults' | project id, name, subscriptionId, rbacMode = tobool(properties.enableRbacAuthorization)" $subs)
+foreach ($vault in $vaults) {
+    $mode = $false
+    $unknownMode = -not [bool]::TryParse("$($vault.rbacMode)", [ref]$mode)
+    if ($unknownMode) { Write-Warning "$($vault.name): vault authorization mode is unknown; considering both RBAC and access-policy access paths." }
+    Add-Member -InputObject $vault -NotePropertyName rbacModeUnknown -NotePropertyValue $unknownMode -Force
+    $vault.rbacMode = $mode
+}
 # AtScopeAboveAndBelow also returns assignments inherited from management groups and the tenant root.
 $rbac = @(Invoke-Graph "authorizationresources | where type =~ 'microsoft.authorization/roleassignments' | where tolower(tostring(properties.principalId)) in ($plist) | project id, principalId = tolower(tostring(properties.principalId)), scope = tostring(properties.scope), roleDefinitionId = tostring(properties.roleDefinitionId)" $subs 'AtScopeAboveAndBelow' |
     Sort-Object id -Unique)
@@ -125,7 +135,7 @@ $subMgs = @{}
 foreach ($c in @(Invoke-Graph "resourcecontainers | where type =~ 'microsoft.resources/subscriptions' | project id, subscriptionId, mgChain = properties.managementGroupAncestorsChain" $subs)) {
     $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($m in @(Expand-Json $c.mgChain)) { if ($m.name) { [void]$set.Add($m.name) } }
-    $subMgs[$c.subscriptionId.ToLower()] = $set
+    $subMgs[$c.subscriptionId.ToLowerInvariant()] = $set
 }
 Write-Host "Key Vaults visible: $($vaults.Count); role assignments for APIM identities: $($rbac.Count); access-policy entries: $($aps.Count)"
 
@@ -146,10 +156,14 @@ function Test-Granted($Perms, [string]$AllowProp, [string]$DenyProp, [string[]]$
 }
 $roleCache = @{}
 function Get-RoleInfo([string]$RoleDefinitionId) {
-    $k = $RoleDefinitionId.ToLower()
+    $k = $RoleDefinitionId.ToLowerInvariant()
     if (-not $roleCache.ContainsKey($k)) {
         $r = Get-Json GET "https://management.azure.com$($RoleDefinitionId)?api-version=2022-04-01"
-        $roleCache[$k] = if ($r._error) {
+        $unresolved = $r._error -or $r.properties.permissions -isnot [System.Collections.IList] -or -not $r.properties.permissions.Count
+        if ($unresolved) {
+            Write-Warning "Could not resolve role ${RoleDefinitionId}: $($r._error). Treating its vault scope as reachable."
+        }
+        $roleCache[$k] = if ($unresolved) {
             [pscustomobject]@{ name = "unresolved role $($RoleDefinitionId.Split('/')[-1])"; resolved = $false; data = $false; policyWrite = $false; grant = $false }
         } else {
             $perms = $r.properties.permissions
@@ -169,7 +183,7 @@ function Get-VaultsInScope([string]$Scope) {
     if ($s -match '^/providers/Microsoft\.Management/managementGroups/([^/]+)$') {
         $mg = $Matches[1]
         # Vaults whose subscription sits under that management group; unknown ancestry counts as in scope.
-        return @($vaults | Where-Object { $set = $subMgs[$_.subscriptionId.ToLower()]; -not $set -or -not $set.Count -or $set.Contains($mg) })
+        return @($vaults | Where-Object { $set = $subMgs[$_.subscriptionId.ToLowerInvariant()]; -not $set -or -not $set.Count -or $set.Contains($mg) })
     }
     # Scope at or above the vault (subscription, resource group, the vault itself), or below it (a single secret/key)
     return @($vaults | Where-Object {
@@ -178,7 +192,7 @@ function Get-VaultsInScope([string]$Scope) {
 
 $cand = @{}
 function Add-Cand($v, $p, $via) {
-    $k = $v.id.ToLower()
+    $k = $v.id.ToLowerInvariant()
     if (-not $cand.ContainsKey($k)) {
         $cand[$k] = @{ vault = $v; principals = [System.Collections.Generic.HashSet[string]]::new(); via = [System.Collections.Generic.HashSet[string]]::new() }
     }
@@ -197,9 +211,9 @@ foreach ($r in $rbac) {
     $hit = 0
     foreach ($v in $inScope) {
         $how = if (-not $role.resolved) { 'role could not be resolved' }
-               elseif ($v.rbacMode -and $role.data) { 'data access' }
+               elseif (($v.rbacMode -or $v.rbacModeUnknown) -and $role.data) { 'data access' }
                elseif ($role.grant) { 'can grant itself access' }
-               elseif (-not $v.rbacMode -and $role.policyWrite) { 'can grant itself access via access policy' }
+               elseif ((-not $v.rbacMode -or $v.rbacModeUnknown) -and $role.policyWrite) { 'can grant itself access via access policy' }
         if ($how) { Add-Cand $v $r.principalId "$($role.name) at $($r.scope) ($how)"; $hit++ }
     }
     if ($inScope.Count -and -not $hit) {
@@ -220,13 +234,22 @@ $logging = foreach ($k in $cand.Keys) {
     $ws = $null; $note = ''
     if ($r._error) { $note = "ERROR: $($r._error)" }
     else {
-        foreach ($d in @($r.value)) {
-            $p = $d.properties
-            $audit = @($p.logs | Where-Object { $_.enabled -and ($_.category -eq 'AuditEvent' -or $_.categoryGroup -in 'audit', 'allLogs') }).Count -gt 0
-            if ($audit -and $p.workspaceId) { $ws = $p.workspaceId; break }
+        try {
+            Assert-ResponseCollection $r 'value' "diagnostic settings for $($v.name)"
+            foreach ($d in @($r.value)) {
+                $p = $d.properties
+                $audit = @($p.logs | Where-Object {
+                    (ConvertTo-ReportBoolean $_.enabled "$($v.name) diagnostic log enabled") -and
+                    ($_.category -eq 'AuditEvent' -or $_.categoryGroup -in 'audit', 'allLogs')
+                }).Count -gt 0
+                if ($audit -and $p.workspaceId) { $ws = $p.workspaceId; break }
+            }
+            if (-not $ws) { $note = if (@($r.value).Count) { 'diagnostic settings exist but AuditEvent does not go to Log Analytics (storage/event hub only?)' } else { 'no diagnostic settings' } }
+        } catch {
+            $ws = $null; $note = "ERROR: $($_.Exception.Message)"
         }
-        if (-not $ws) { $note = if (@($r.value).Count) { 'diagnostic settings exist but AuditEvent does not go to Log Analytics (storage/event hub only?)' } else { 'no diagnostic settings' } }
     }
+    if ($note -like 'ERROR:*') { Write-Warning "$($v.name): diagnostic settings could not be assessed. $note" }
     [pscustomobject]@{
         vaultId = $v.id; vault = $v.name; subscriptionId = $v.subscriptionId
         principals = ($cand[$k].principals -join ','); via = ($cand[$k].via -join '; ')
@@ -239,21 +262,13 @@ $logging | Export-Csv "$OutDir\vault-logging.csv"
 function Invoke-La([string]$ws, [string]$kql) {
     $r = Get-Json POST "https://management.azure.com$ws/api/query?api-version=2017-01-01-preview" @{ query = $kql; timespan = "P$($LookbackDays)D" }
     if ($r._error) { throw $r._error }
-    $t = $r.tables[0]
-    # This endpoint returns Columns[].ColumnName; the newer API returns columns[].name. Accept both.
-    $cols = @($t.columns | ForEach-Object { if ($_.name) { $_.name } else { $_.ColumnName } })
-    if (-not $cols.Count -or -not $cols[0]) { throw "Unexpected response shape from Log Analytics: $($r | ConvertTo-Json -Depth 4 -Compress)" }
-    foreach ($row in $t.rows) {
-        $o = [ordered]@{}
-        for ($c = 0; $c -lt $cols.Count; $c++) { $o[$cols[$c]] = $row[$c] }
-        [pscustomobject]$o
-    }
+    ConvertFrom-LogAnalyticsResponse $r
 }
 # Both Key Vault log schemas, normalised. Column names are case-sensitive:
 #   AzureDiagnostics: ResourceId, CallerIPAddress, identity_claim_oid_g (or the long objectidentifier claim), id_s, httpStatusCode_d
 #   AZKVAuditLogs:    _ResourceId, CallerIpAddress, Identity.claim.oid (or the long objectidentifier claim), Id, HttpStatusCode
 function Build-Src($vaultIds) {
-    $vl = ($vaultIds | ForEach-Object { "'" + $_.ToLower() + "'" }) -join ','
+    $vl = ($vaultIds | ForEach-Object { "'" + $_.ToLowerInvariant() + "'" }) -join ','
     @"
 let vaultIds = dynamic([$vl]);
 let src = union isfuzzy=true
@@ -274,8 +289,17 @@ let src = union isfuzzy=true
 
 "@
 }
-$ws0 = $WindowStart.ToString('yyyy-MM-dd'); $we0 = $WindowEnd.ToString('yyyy-MM-dd')
-$cov = @(); $pact = @(); $newc = @(); $qerr = @{}
+function Build-ApimActivityQuery([string]$Source, [string]$PrincipalList, [datetime]$Start, [datetime]$End) {
+    $startUtc = $Start.ToString('yyyy-MM-ddTHH:mm:ss.fffffff', [Globalization.CultureInfo]::InvariantCulture)
+    $endUtc = $End.ToString('yyyy-MM-ddTHH:mm:ss.fffffff', [Globalization.CultureInfo]::InvariantCulture)
+    return $Source + "src | where TimeGenerated >= datetime($startUtc) and TimeGenerated < datetime($endUtc) | where Oid in (dynamic([$PrincipalList])) | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated) by ResourceId, Oid, CallerIP, OperationName"
+}
+$ws0 = $WindowStart.ToString('yyyy-MM-ddTHH:mm:ss.fffffff', [Globalization.CultureInfo]::InvariantCulture)
+$we0 = $WindowEnd.ToString('yyyy-MM-ddTHH:mm:ss.fffffff', [Globalization.CultureInfo]::InvariantCulture)
+$cov = [System.Collections.Generic.List[object]]::new()
+$pact = [System.Collections.Generic.List[object]]::new()
+$newc = [System.Collections.Generic.List[object]]::new()
+$qerr = @{}
 $byWs = @($logging | Where-Object { $_.workspaceId } | Group-Object workspaceId)
 $w = 0
 foreach ($g in $byWs) {
@@ -284,12 +308,12 @@ foreach ($g in $byWs) {
     # Missing IP / object ID only counts on authenticated data-plane calls. 401 'Authentication' challenges and
     # control-plane operations (VaultGet, AccessPolicy*, ...) never carry an object ID, so they would only add noise.
     $q1 = $src + "src | extend DataPlane = (OperationName startswith 'Secret' or OperationName startswith 'Key' or OperationName startswith 'Certificate') and coalesce(Http, 0) != 401 | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated), Sources=strcat_array(make_set(Source), ','), DataPlaneEvents=countif(DataPlane), MissingIp=countif(DataPlane and isempty(CallerIP)), MissingOid=countif(DataPlane and isempty(Oid)) by ResourceId"
-    $q2 = $src + "src | where Oid in (dynamic([$plist])) | summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated) by ResourceId, Oid, CallerIP, OperationName"
+    $q2 = Build-ApimActivityQuery $src $plist $WindowStart $WindowEnd
     $q3 = $src + "let ops = dynamic(['SecretGet','SecretList','SecretBackup','SecretListVersions','KeyGet','KeyList','KeyBackup','CertificateGet','CertificateList','CertificateBackup']); let base = src | where TimeGenerated < datetime($ws0) | distinct ResourceId, Oid, CallerIP; src | where TimeGenerated >= datetime($ws0) and TimeGenerated < datetime($we0) and OperationName in (ops) | summarize Events=count(), DistinctItems=dcount(ItemId), First=min(TimeGenerated), Last=max(TimeGenerated), Ops=tostring(make_set(OperationName)) by ResourceId, Oid, CallerIP | join kind=leftanti base on ResourceId, Oid, CallerIP | order by Events desc"
     try {
-        $cov += @(Invoke-La $g.Name $q1)
-        $pact += @(Invoke-La $g.Name $q2)
-        $newc += @(Invoke-La $g.Name $q3)
+        $cov.AddRange([object[]]@(Invoke-La $g.Name $q1))
+        $pact.AddRange([object[]]@(Invoke-La $g.Name $q2))
+        $newc.AddRange([object[]]@(Invoke-La $g.Name $q3))
     } catch { $qerr[$g.Name] = "$($_.Exception.Message)"; Write-Warning "Query failed for $($g.Name): $($qerr[$g.Name])" }
 }
 foreach ($c in @($cov | Where-Object { [int]$_.MissingIp -gt 0 -or [int]$_.MissingOid -gt 0 })) {
@@ -312,7 +336,10 @@ foreach ($c in $cov) {
 # Flag APIM-identity activity coming from an address that is not one of that instance's own IPs
 foreach ($row in $pact) {
     $apis = @($principalMap[$row.Oid])
-    $exp = @($apis | ForEach-Object { Get-Ips $_.publicIPs; Get-Ips $_.privateIPs })
+    $exp = @($apis | ForEach-Object {
+        Get-Ips $_.publicIPs; Get-Ips $_.privateIPs
+        foreach ($location in @(Expand-Json $_.additionalLocations)) { Get-Ips $location.publicIPAddresses; Get-Ips $location.privateIPAddresses }
+    })
     $flag = if (-not $row.CallerIP) { 'IP-MISSING (no caller IP in the log row)' }
             elseif (-not $exp.Count) { 'IP-UNVERIFIABLE (instance has no static IP, e.g. Consumption)' }
             elseif ($row.CallerIP -in $exp) { 'expected' } else { 'UNEXPECTED IP' }
@@ -324,23 +351,37 @@ $pact | Export-Csv "$OutDir\apim-identity-activity.csv"
 $newc | Export-Csv "$OutDir\new-callers-in-window.csv"
 
 # ---- 5. Verdict per vault -----------------------------------------------------------------------
+function Get-VaultStatus([string]$WorkspaceId, [bool]$QueryFailed, $Coverage, [int]$UnexpectedIps,
+                         [int]$NewCallers, [int]$UnverifiableIps, [datetime]$Start, [datetime]$End, [switch]$LoggingFailed) {
+    if ($LoggingFailed) { return 'DIAGNOSTIC SETTINGS FAILED - cannot assess' }
+    if (-not $WorkspaceId) { return 'NO AUDIT LOGGING - cannot assess' }
+    if ($QueryFailed) { return 'QUERY FAILED - cannot assess' }
+    if (-not $Coverage) { return 'NO LOG DATA IN LOOKBACK - cannot assess' }
+    if ($UnexpectedIps -or $NewCallers) { return 'SUSPICIOUS - review' }
+    if ($UnverifiableIps) { return 'REVIEW - APIM identity activity, source IPs unverifiable' }
+    if ([int]$Coverage.MissingIp -gt 0 -or [int]$Coverage.MissingOid -gt 0) {
+        return 'PARTIAL COVERAGE - authenticated data-plane rows lack caller IP or object ID'
+    }
+    if (-not $Coverage.First -or -not $Coverage.Last) { return 'PARTIAL COVERAGE - log timestamps missing' }
+    if (([datetimeoffset]$Coverage.First).UtcDateTime -gt $Start) { return 'PARTIAL COVERAGE - logs start after window start' }
+    # Event timestamps cannot prove continuous logging, but must at least bracket the requested window.
+    if (([datetimeoffset]$Coverage.Last).UtcDateTime -lt $End) { return 'PARTIAL COVERAGE - logs do not extend to window end' }
+    return 'no anomaly found in available logs'
+}
 $verdicts = foreach ($l in $logging) {
-    $vid = $l.vaultId.ToLower()
+    $vid = $l.vaultId.ToLowerInvariant()
     $c = $cov | Where-Object { $_.ResourceId -eq $vid } | Select-Object -First 1
     $pa = @($pact | Where-Object { $_.ResourceId -eq $vid })
     $nc = @($newc | Where-Object { $_.ResourceId -eq $vid })
     $unexp = @($pa | Where-Object { $_.Flag -eq 'UNEXPECTED IP' }).Count
     $unver = @($pa | Where-Object { $_.Flag -like 'IP-UNVERIFIABLE*' -or $_.Flag -like 'IP-MISSING*' }).Count
-    $status = if (-not $l.workspaceId) { 'NO AUDIT LOGGING - cannot assess' }
-              elseif ($qerr.ContainsKey($l.workspaceId)) { 'QUERY FAILED - cannot assess' }
-              elseif (-not $c) { 'NO LOG DATA IN LOOKBACK - cannot assess' }
-              elseif ($unexp -or $nc.Count) { 'SUSPICIOUS - review' }
-              elseif ($unver) { 'REVIEW - APIM identity activity, source IPs unverifiable' }
-              elseif (([datetimeoffset]$c.First).UtcDateTime -gt $WindowStart) { 'PARTIAL COVERAGE - logs start after window start' }
-              else { 'no anomaly found in available logs' }
+    $status = Get-VaultStatus -WorkspaceId $l.workspaceId -QueryFailed ($l.workspaceId -and $qerr.ContainsKey($l.workspaceId)) -Coverage $c `
+                             -UnexpectedIps $unexp -NewCallers $nc.Count -UnverifiableIps $unver -Start $WindowStart -End $WindowEnd `
+                             -LoggingFailed:($l.note -like 'ERROR:*')
     [pscustomobject]@{
         status = $status; vault = $l.vault; subscriptionId = $l.subscriptionId
-        logsFrom = if ($c) { $c.First } else { $null }; logEvents = if ($c) { $c.Events } else { 0 }
+        logsFrom = if ($c) { $c.First } else { $null }; logsTo = if ($c) { $c.Last } else { $null }
+        logEvents = if ($c) { $c.Events } else { 0 }
         logSources = if ($c) { $c.Sources } else { '' }
         baselineDays = if ($c) { [Math]::Round([Math]::Max(0, ($WindowStart - ([datetimeoffset]$c.First).UtcDateTime).TotalDays), 1) } else { $null }
         apimIdentityEvents = ($pa | Measure-Object Events -Sum).Sum; unexpectedIpRows = $unexp
@@ -365,7 +406,8 @@ How to read this:
   baselineDays (in vault-verdicts.csv) = how many days of logs exist before the window. A short baseline (e.g. a
                workspace that keeps 30 days) makes ordinary callers - CI agents on changing IPs, admins on a new
                network - show up as new. Check the client (user agent) and history before concluding anything.
-  'no anomaly found' only covers the period the logs cover (see logsFrom) and only data that was logged.
+  'no anomaly found' requires log timestamps bracketing the window and complete caller fields (see logsFrom/logsTo).
+  This still cannot prove continuous logging; a quiet vault can be PARTIAL even if logging stayed enabled.
   Anything 'cannot assess' / PARTIAL means there is no evidence either way - treat as potentially accessed.
   Absence of events is not proof of safety: the described legacy API had no logging, but its use of a
   vault would still appear in Key Vault's own audit log if diagnostics were on.
