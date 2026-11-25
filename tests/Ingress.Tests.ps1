@@ -12,6 +12,7 @@ Run:  Invoke-Pester ./tests
 function New-TestPathway([string]$Class, [string]$Waf = '', [bool]$Bypass = $false) { [pscustomobject]@{ sourceClass = $Class; wafVerdict = $Waf; bypassable = $Bypass } }
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot '../Apim-Helpers.ps1')   # Get-ResourceName and the tier rules the script shares with the scanners
     # Same helper again for the test bodies: Pester runs them in a scope that does not see file-level functions.
     function New-TestPathway([string]$Class, [string]$Waf = '', [bool]$Bypass = $false) { [pscustomobject]@{ sourceClass = $Class; wafVerdict = $Waf; bypassable = $Bypass } }
     $scriptPath = Join-Path $PSScriptRoot '../Check-IngressExposure.ps1'

@@ -5,15 +5,17 @@ End-to-end test for Check-IngressExposure.ps1: runs the script's real main flow 
 CSV and report output) against the synthetic tenant in fixtures/ingress-tenant.json. Only the Azure calls are
 replaced: az, Resource Graph (Invoke-Graph) and the ARM reads (Get-Paged, Get-One). No Azure access needed.
 
-The fixture holds nine instances: no VNet with and without a private endpoint, External with Microsoft's
+The fixture holds eleven instances: no VNet with and without a private endpoint, External with Microsoft's
 reference NSG behind an Application Gateway WAF, Internal locked down behind Front Door Premium over Private Link,
 Internal with port 3443 open to the internet, External with a broad partner range and Traffic Manager, Internal
-reached through Azure Firewall DNAT rules, plus a v2 and a Consumption instance that the tier rule leaves out.
+reached through Azure Firewall DNAT rules, a v2 and a Consumption instance that the tier rule leaves out, one with
+an unrecognized SKU that is retained for review, and one in a subscription of another tenant that is never read.
 
 Run:  Invoke-Pester ./tests
 #>
 
 BeforeAll {
+    . (Join-Path $PSScriptRoot '../Apim-Helpers.ps1')   # the script dot-sources it at its top, which the loader below skips
     $scriptPath = Join-Path $PSScriptRoot '../Check-IngressExposure.ps1'
     $script:scriptText = Get-Content $scriptPath -Raw
     $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $scriptPath), [ref]$null, [ref]$null)
@@ -33,9 +35,11 @@ BeforeAll {
     $script:fixture = Get-Content (Join-Path $PSScriptRoot 'fixtures/ingress-tenant.json') -Raw | ConvertFrom-Json
 
     # ---- stubs for everything that would touch Azure ----
+    # az is reached through Invoke-AzJson (`az <args> --output json`), which checks $LASTEXITCODE after the call
+    $script:azCalls = [System.Collections.Generic.List[string]]::new()
     function az {
-        $a = "$args"
-        if ($a -match 'account show') { return $script:fixture.tenantId }
+        $a = "$args"; $script:azCalls.Add($a); $global:LASTEXITCODE = 0
+        if ($a -match 'account show') { return (@{ id = $script:fixture.accounts[0].id; tenantId = $script:fixture.tenantId } | ConvertTo-Json -Compress) }
         if ($a -match 'account list') { return ($script:fixture.accounts | ConvertTo-Json -AsArray -Depth 5) }
         throw "unexpected az call: $a"
     }
@@ -76,10 +80,9 @@ BeforeAll {
         throw "unexpected ARM get: $Url"
     }
     # Runs the main flow with the script's parameters as local variables; console output goes to console.txt
-    function Invoke-IngressFlow([string]$OutDir, [switch]$AllInstances, [switch]$IncludeConsumption) {
-        $ExposureDir = Join-Path $OutDir 'no-exposure-dir'   # no scope.csv there, so the tier rule applies
-        $TightPrefixLength = 24; $TightPrefixLengthV6 = 48; $SkipPolicy = $false; $CheckGatewayPatch = $false; $TenantId = ''
-        $global:LASTEXITCODE = 0
+    function Invoke-IngressFlow([string]$OutDir, [switch]$AllInstances, [switch]$IncludeConsumption, [string]$TenantId = '', [string]$ExposureDir = '') {
+        if (-not $ExposureDir) { $ExposureDir = Join-Path $OutDir 'no-exposure-dir' }   # no scope.csv there, so the tier rule applies
+        $TightPrefixLength = 24; $TightPrefixLengthV6 = 48; $SkipPolicy = $false; $CheckGatewayPatch = $false
         New-Item -ItemType Directory -Force $OutDir | Out-Null
         . ([scriptblock]::Create($script:flow)) *> (Join-Path $OutDir 'console.txt')
         [pscustomobject]@{ summary = @($summary); pathways = @($pathways); nsgRows = @($nsgRows); policyRows = @($policyRows); wafPolicyRows = @($wafPolicyRows); outDir = $OutDir }
@@ -92,10 +95,18 @@ Describe 'End-to-end run against the synthetic tenant' {
         $script:st = @{}; foreach ($s in $script:run.summary) { $script:st[$s.apim] = $s }
         $script:pw = @($script:run.pathways)
     }
-    It 'analyses the Classic dedicated tiers only (tier rule, no scope.csv)' {
-        $script:run.summary.Count | Should -Be 7
+    It 'analyses the Classic dedicated tiers and retains an unrecognized SKU (tier rule, no scope.csv)' {
+        $script:run.summary.Count | Should -Be 8
         $script:st.ContainsKey('apim-v2-standard') | Should -BeFalse
         $script:st.ContainsKey('apim-consumption') | Should -BeFalse
+        $script:st['apim-unknown-sku'].tierFamily | Should -Be 'Unknown'
+        $script:st['apim-unknown-sku'].scope | Should -Match "unrecognized or missing SKU 'FutureTier': scope cannot be determined"
+        $script:st['apim-unknown-sku'].ingressStatus | Should -Be 'OPEN'
+        $script:st['apim-unknown-sku'].managementReach | Should -BeLike 'INTERNET*'
+    }
+    It 'never reads a subscription of another tenant' {
+        $script:st.ContainsKey('apim-other-tenant') | Should -BeFalse
+        Get-Content (Join-Path $script:run.outDir 'console.txt') -Raw | Should -Match 'Skipping 1 subscription\(s\) in 1 other tenant\(s\): 00000000-0000-0000-0000-00000000bbbb \(1\)'
     }
     It 'rates <Apim> <Status>' -TestCases @(
         @{ Apim = 'apim-none-open'; Status = 'OPEN' }, @{ Apim = 'apim-none-private'; Status = 'PRIVATE' }, @{ Apim = 'apim-external-ref'; Status = 'OPEN' }
@@ -171,17 +182,67 @@ Describe 'End-to-end run against the synthetic tenant' {
         $report = Get-Content (Join-Path $script:run.outDir 'ingress-report.md') -Raw
         $report | Should -Match 'apim-internal-3443-open'
         $report | Should -Match 'WAF BYPASSABLE'
-        @(Import-Csv (Join-Path $script:run.outDir 'ingress-summary.csv')).Count | Should -Be 7
-        Get-Content (Join-Path $script:run.outDir 'console.txt') -Raw | Should -Match 'Skipping 1 subscription\(s\) in 1 other tenant'
+        @(Import-Csv (Join-Path $script:run.outDir 'ingress-summary.csv')).Count | Should -Be 8
     }
 }
 
 Describe 'End-to-end run with -AllInstances' {
     It 'analyses v2 and Consumption instances without a 3443 endpoint' {
         $run = Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'all') -AllInstances
-        $run.summary.Count | Should -Be 9
+        $run.summary.Count | Should -Be 10
+        @($run.summary.apim) | Should -Not -Contain 'apim-other-tenant'
         $v2 = $run.summary | Where-Object apim -eq 'apim-v2-standard'
         $v2.managementReach | Should -BeLike 'n/a*'; $v2.ingressStatus | Should -Be 'OPEN'
         ($run.summary | Where-Object apim -eq 'apim-consumption').managementReach | Should -BeLike 'n/a*'
+    }
+}
+
+Describe 'End-to-end run with -TenantId' {
+    It 'reads the named tenant without asking az for the current account, also before any native command has run' {
+        $previous = $global:LASTEXITCODE
+        try {
+            $global:LASTEXITCODE = $null   # a fresh pwsh process: the old inline check read this as a failure
+            $script:azCalls.Clear()
+            $run = Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'tenant') -TenantId '00000000-0000-0000-0000-00000000aaaa'
+            $run.summary.Count | Should -Be 8
+            @($script:azCalls | Where-Object { $_ -match 'account show' }).Count | Should -Be 0
+            @($script:azCalls | Where-Object { $_ -match 'account list' }).Count | Should -Be 1
+        } finally { $global:LASTEXITCODE = $previous }
+    }
+    It 'fails clearly when the named tenant has no enabled subscriptions' {
+        { Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'tenant-empty') -TenantId '00000000-0000-0000-0000-00000000cccc' } |
+            Should -Throw '*No enabled subscriptions in tenant 00000000-0000-0000-0000-00000000cccc*'
+    }
+}
+
+Describe 'End-to-end run with a scope file from Check-ApimExposure.ps1' {
+    BeforeAll {
+        $script:exposureDir = Join-Path $TestDrive 'exposure'
+        New-Item -ItemType Directory -Force $script:exposureDir | Out-Null
+        $prefix = '/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/'
+        @(
+            [pscustomobject]@{ id = "${prefix}apim-none-open"; inScope = 'False'; reason = 'not listed by Microsoft' }
+            [pscustomobject]@{ id = "${prefix}apim-v2-standard"; inScope = 'True'; reason = 'listed by Microsoft, but now a v2 tier (migrated after the incident?)' }
+            [pscustomobject]@{ id = "${prefix}apim-unknown-sku"; inScope = 'False'; reason = 'not listed by Microsoft' }
+        ) | Export-Csv (Join-Path $script:exposureDir 'scope.csv')
+    }
+    It 'applies the file, keeps an unrecognized SKU for review and falls back to the tier rule for instances the file does not know' {
+        $run = Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'scoped') -ExposureDir $script:exposureDir
+        $names = @($run.summary.apim)
+        $names | Should -Not -Contain 'apim-none-open'
+        $names | Should -Contain 'apim-v2-standard'
+        $names | Should -Contain 'apim-unknown-sku'
+        $run.summary.Count | Should -Be 8
+        ($run.summary | Where-Object apim -eq 'apim-v2-standard').scope | Should -Be 'scope.csv: listed by Microsoft, but now a v2 tier (migrated after the incident?)'
+        ($run.summary | Where-Object apim -eq 'apim-v2-standard').managementReach | Should -BeLike 'n/a*'
+        ($run.summary | Where-Object apim -eq 'apim-external-ref').scope | Should -Match 'Classic dedicated tier'
+        Get-Content (Join-Path $TestDrive 'scoped/console.txt') -Raw | Should -Match 'apim-external-ref is missing from .*scope\.csv; applying the tier fallback'
+    }
+    It 'stops on a malformed scope file instead of silently excluding instances' {
+        $bad = Join-Path $TestDrive 'exposure-bad'
+        New-Item -ItemType Directory -Force $bad | Out-Null
+        [pscustomobject]@{ id = '/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-none-open'; inScope = 'maybe' } |
+            Export-Csv (Join-Path $bad 'scope.csv')
+        { Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'scoped-bad') -ExposureDir $bad } | Should -Throw '*Expected True or False*'
     }
 }

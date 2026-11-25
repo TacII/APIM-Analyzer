@@ -4,7 +4,8 @@ Maps every internet ingress pathway to the in-scope Azure API Management (APIM) 
 permissive each one is: open or broad NSG rules on the APIM subnet, Application Gateway and Front Door WAF policies
 (disabled, detection-only, permissive custom rules, bypassable), Traffic Manager and Azure Firewall DNAT paths,
 and the instance's own network mode (none / external / internal VNet, private endpoints, public network access).
-Read-only. Needs Reader on the subscriptions. Run `az login` first (az CLI). Output goes to .\ingress-exposure\ .
+Read-only. Needs Reader on the subscriptions and Apim-Helpers.ps1 alongside this script. Run `az login` first (az CLI).
+Output goes to .\ingress-exposure\ .
 
 Why: Microsoft's November 2026 notice says a Classic instance may have been accessed if it lacked the network
 integration from the "Network security" section of the recommended secret management practices. The service
@@ -12,7 +13,8 @@ configuration (management) endpoint on port 3443 and the public gateway/portal/G
 pathways that matter. This script shows, per instance, who on the internet could reach them and through what.
 
 Scope: apim-exposure/scope.csv from Check-ApimExposure.ps1 when present (Microsoft's impacted-resources list or
-the tier rule); otherwise Classic dedicated tiers. -AllInstances analyses every instance you can see.
+the tier rule), validated as in the audit and analysis scripts; otherwise the shared tier rule, which retains an
+unrecognized SKU for review. -AllInstances analyses every instance you can see.
 
 Author:  Tim Kidd (ingress analysis), building on the APIM incident tools by Mathias Haas, Fidelity Consulting AB
 License: MIT (see LICENSE). Provided as is, without warranty.
@@ -29,16 +31,17 @@ param(
     [string]$TenantId                  # Entra tenant to read; default: the tenant of the current az account (subscriptions in other tenants are skipped)
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Apim-Helpers.ps1')
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
 # ---- ARM / Resource Graph helpers (direct REST with a token from az; see docs/DEVLOG.md for why not `az rest`) ----
 $script:armToken = $null
 function Get-ArmToken {
     if (-not $script:armToken -or $script:armToken.expires -lt [DateTimeOffset]::UtcNow.AddMinutes(5)) {
-        $azArgs = @('--resource', 'https://management.azure.com/')
+        $azArgs = @('account', 'get-access-token', '--resource', 'https://management.azure.com/')
         if ($script:tenantId) { $azArgs += @('--tenant', $script:tenantId) }
-        $t = az account get-access-token @azArgs -o json | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0 -or -not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
+        $t = Invoke-AzJson $azArgs
+        if (-not $t.accessToken) { throw 'Could not get an Azure Resource Manager token. Run az login.' }
         $exp = if ($t.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$t.expires_on) } else { [DateTimeOffset]::new([datetime]$t.expiresOn) }
         $script:armToken = @{ value = $t.accessToken; expires = $exp }
     }
@@ -63,6 +66,7 @@ function Invoke-Graph([string]$Query, [string[]]$Subs) {
     for ($c = 0; $c -lt $Subs.Count; $c += 1000) {
         $chunk = @($Subs[$c..([Math]::Min($c + 999, $Subs.Count - 1))])
         $got = 0; $skip = $null
+        $tokens = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         do {
             $opts = [ordered]@{ '$top' = 1000; resultFormat = 'objectArray' }
             if ($skip) { $opts['$skipToken'] = $skip }
@@ -70,8 +74,12 @@ function Invoke-Graph([string]$Query, [string[]]$Subs) {
                 @{ subscriptions = $chunk; query = $Query; options = $opts }
             if (-not $res.ok) { throw "Resource Graph query failed: $($res.error)" }
             $r = $res.data
+            Assert-ResponseCollection $r 'data' 'Resource Graph'
             foreach ($d in @($r.data)) { $got++; $d }
-            $skip = $r.'$skipToken'
+            $next = $r.'$skipToken'
+            if ($next -and -not $tokens.Add("$next")) { throw 'Resource Graph repeated a continuation token; paging aborted.' }
+            $skip = $next
+            if ("$($r.resultTruncated)" -eq 'true' -and -not $skip) { throw 'Resource Graph truncated results without a continuation token.' }
         } while ($skip)
         if ($r.totalRecords -gt $got) { throw "Result truncated ($got of $($r.totalRecords)) - the query is not being applied as intended." }
     }
@@ -99,9 +107,13 @@ function Invoke-ArmGet([string]$Url) {
 }
 function Get-Paged([string]$Url) {
     $orig = $Url
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     while ($Url) {
+        if (-not $seen.Add($Url)) { $script:failures += [pscustomobject]@{ url = $orig; error = 'Repeated nextLink; paging aborted.' }; return }
         $res = Invoke-ArmGet $Url
         if (-not $res.ok) { $script:failures += [pscustomobject]@{ url = $orig; error = $res.error }; return }
+        try { Assert-ResponseCollection $res.data 'value' $Url }
+        catch { $script:failures += [pscustomobject]@{ url = $orig; error = $_.Exception.Message }; return }
         $res.data.value
         $Url = $res.data.nextLink
     }
@@ -115,7 +127,6 @@ function Expand-Json($v) {
     if ($v -is [string]) { if (-not $v.Trim()) { return $null }; try { return $v | ConvertFrom-Json } catch { return $v } }
     return $v
 }
-function Get-LastSegment([string]$Id) { if ($Id) { ("$Id".TrimEnd('/') -split '/')[-1] } else { '' } }
 # Subscription ID of a resource ID, lower case
 function Get-SubOfId([string]$Id) { if ("$Id" -match '^/subscriptions/([^/]+)/') { $Matches[1].ToLower() } else { '' } }
 
@@ -230,10 +241,10 @@ function Get-NsgRules($Nsg) {
             $sources = @(); $dests = @(); $portVals = @()
             if ($p.sourceAddressPrefix) { $sources += "$($p.sourceAddressPrefix)" }
             $sources += @($p.sourceAddressPrefixes | ForEach-Object { "$_" } | Where-Object { $_ })
-            $sources += @($p.sourceApplicationSecurityGroups | Where-Object { $_ } | ForEach-Object { 'ASG:' + (Get-LastSegment $_.id) })
+            $sources += @($p.sourceApplicationSecurityGroups | Where-Object { $_ } | ForEach-Object { 'ASG:' + (Get-ResourceName $_.id) })
             if ($p.destinationAddressPrefix) { $dests += "$($p.destinationAddressPrefix)" }
             $dests += @($p.destinationAddressPrefixes | ForEach-Object { "$_" } | Where-Object { $_ })
-            $dests += @($p.destinationApplicationSecurityGroups | Where-Object { $_ } | ForEach-Object { 'ASG:' + (Get-LastSegment $_.id) })
+            $dests += @($p.destinationApplicationSecurityGroups | Where-Object { $_ } | ForEach-Object { 'ASG:' + (Get-ResourceName $_.id) })
             if ($p.destinationPortRange) { $portVals += "$($p.destinationPortRange)" }
             $portVals += @($p.destinationPortRanges | ForEach-Object { "$_" } | Where-Object { $_ })
             $srcPortVals = @()
@@ -645,16 +656,10 @@ function Get-IngressStatus($Pathways, [bool]$Unchecked) {
 # =====================================================================================================
 $base = 'https://management.azure.com'
 $netApi = 'api-version=2024-05-01'; $cdnApi = 'api-version=2026-10-01'; $apimApi = 'api-version=2024-05-01'
-# One tenant per run. `az account list` spans every tenant this login has touched, but a token is valid for one
-# tenant, so only that tenant's enabled subscriptions are read; the rest are listed and skipped. Pass -TenantId <id>
-# (after `az login --tenant <id>`) to read another tenant.
-$script:tenantId = if ($TenantId) { $TenantId } else { "$(az account show --query tenantId -o tsv)" }
-if ($LASTEXITCODE -ne 0 -or -not $script:tenantId) { throw 'Could not determine the current tenant. Run az login.' }
-$accounts = @(az account list --query "[?state=='Enabled']" -o json | ConvertFrom-Json)
-$subs = @($accounts | Where-Object { "$($_.tenantId)" -ieq $script:tenantId -and "$($_.id)" -ine "$($_.tenantId)" } | ForEach-Object { "$($_.id)" })
-$otherTenants = @($accounts | Where-Object { "$($_.tenantId)" -ine $script:tenantId -and "$($_.id)" -ine "$($_.tenantId)" } | Group-Object tenantId)
-if ($otherTenants.Count) { Write-Host "Skipping $(($otherTenants | Measure-Object -Property Count -Sum).Sum) subscription(s) in $($otherTenants.Count) other tenant(s): $(($otherTenants | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join ', '). Run with -TenantId <id> after 'az login --tenant <id>' to read them." -ForegroundColor DarkGray }
-if (-not $subs.Count) { throw "No enabled subscriptions in tenant $($script:tenantId). Run az login, or pass -TenantId." }
+# One tenant per run (Get-EnabledSubscription in Apim-Helpers.ps1): only that tenant's enabled subscriptions are read and
+# the rest are listed and skipped. Pass -TenantId <id> after `az login --tenant <id>` to read another tenant.
+$script:tenantId = Get-AzTenantId $TenantId
+$subs = @(Get-EnabledSubscription -TenantId $script:tenantId)
 Write-Host "Tenant $($script:tenantId): $($subs.Count) subscription(s). Reading APIM instances, networks, NSGs, gateways, Front Doors, Traffic Manager profiles and firewalls..."
 
 $allApim = @(Invoke-Graph @"
@@ -669,23 +674,30 @@ resources
     gatewayUrl = tostring(properties.gatewayUrl), developerPortalStatus = tostring(properties.developerPortalStatus)
 "@ $subs)
 
-# Scope: scope.csv from Check-ApimExposure.ps1 when present, otherwise the tier rule; -AllInstances takes everything.
-function Get-TierFamily([string]$Sku) { if ($Sku -match 'V2$') { 'v2' } elseif ($Sku -eq 'Consumption') { 'Classic (Consumption)' } else { 'Classic' } }
+# Scope: scope.csv from Check-ApimExposure.ps1 when present, validated and applied by Select-ApimInstance as in the audit
+# and analysis scripts (an unrecognized SKU is always retained for review); otherwise the shared tier rule. -AllInstances
+# takes everything.
 $scopeFile = Join-Path $ExposureDir 'scope.csv'
-$scopeRows = if (Test-Path $scopeFile) { @(Import-Csv $scopeFile) } else { @() }
+$hasScopeFile = Test-Path -LiteralPath $scopeFile
+$scopeRows = if ($hasScopeFile) { @(Import-Csv -LiteralPath $scopeFile) } else { @() }
+$selected = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+if (-not $AllInstances) {
+    foreach ($s in @(Select-ApimInstance $allApim $scopeFile -IncludeConsumption:$IncludeConsumption)) { [void]$selected.Add("$($s.id)".TrimEnd('/')) }
+}
 $scopeOf = @{}
 foreach ($a in $allApim) {
-    $sc = $scopeRows | Where-Object { "$($_.id)" -ieq "$($a.id)" } | Select-Object -First 1
-    $fam = Get-TierFamily $a.sku
-    $dec = if ($AllInstances) { @{ inScope = $true; reason = 'all instances (-AllInstances)' } }
-           elseif ($sc) { @{ inScope = ($sc.inScope -eq 'True'); reason = "scope.csv: $($sc.reason)" } }
-           elseif ($fam -eq 'v2') { @{ inScope = $false; reason = 'v2 tier (not affected)' } }
-           elseif ($fam -eq 'Classic (Consumption)') { @{ inScope = [bool]$IncludeConsumption; reason = $(if ($IncludeConsumption) { 'Consumption (-IncludeConsumption)' } else { 'Consumption tier: out of scope by default' }) } }
-           else { @{ inScope = $true; reason = "Classic dedicated tier (platform $(if ($a.platformVersion) { $a.platformVersion } else { 'unknown' }))" } }
-    $scopeOf["$($a.id)".ToLower()] = [pscustomobject]@{ inScope = $dec.inScope; reason = $dec.reason; tierFamily = $fam }
+    $key = "$($a.id)".TrimEnd('/')
+    # Tier family and fallback reason from the shared rule. Select-ApimInstance has already warned about an unknown SKU.
+    $dec = if ($AllInstances) { Get-ScopeDecision $a $null -IncludeConsumption:$IncludeConsumption }
+           else { & { $WarningPreference = 'SilentlyContinue'; Get-ScopeDecision $a $null -IncludeConsumption:$IncludeConsumption } }
+    $sc = if ($hasScopeFile) { $scopeRows | Where-Object { "$($_.id)".TrimEnd('/') -ieq $key } | Select-Object -First 1 } else { $null }
+    $reason = if ($AllInstances) { 'all instances (-AllInstances)' }
+              elseif ($sc -and $dec.tierFamily -ne 'Unknown') { "scope.csv$(if ($sc.reason) { ": $($sc.reason)" })" }
+              else { $dec.reason }
+    $scopeOf["$($a.id)".ToLower()] = [pscustomobject]@{ inScope = ($AllInstances -or $selected.Contains($key)); reason = $reason; tierFamily = $dec.tierFamily }
 }
 $apim = @($allApim | Where-Object { $scopeOf["$($_.id)".ToLower()].inScope })
-Write-Host "APIM instances: $($allApim.Count) visible, $($apim.Count) analysed ($(if ($AllInstances) { 'all instances' } elseif ($scopeRows.Count) { "scope from $scopeFile" } else { 'tier rule' }))"
+Write-Host "APIM instances: $($allApim.Count) visible, $($apim.Count) analysed ($(if ($AllInstances) { 'all instances' } elseif ($hasScopeFile) { "scope from $scopeFile" } else { 'tier rule' }))"
 if (-not $apim.Count) { Write-Warning 'No instances to analyse.'; return }
 
 # Direct management API and Git flags from Check-ApimExposure.ps1, when its summary exists
@@ -756,7 +768,7 @@ function Expand-FirewallSources($Rule) {
     $src = @($Rule.sourceAddresses | ForEach-Object { "$_" } | Where-Object { $_ })
     foreach ($g in @($Rule.sourceIpGroups | ForEach-Object { "$_" } | Where-Object { $_ })) {
         $k = $g.ToLower()
-        if ($ipGroups.ContainsKey($k)) { $src += $ipGroups[$k] } else { $src += "ipgroup:$(Get-LastSegment $g)" }
+        if ($ipGroups.ContainsKey($k)) { $src += $ipGroups[$k] } else { $src += "ipgroup:$(Get-ResourceName $g)" }
     }
     @($src | Sort-Object -Unique)
 }
@@ -779,7 +791,7 @@ function Get-GatewayPatchStatus([string]$Version) {
 $nsgRows = @(); $pathways = @(); $policyRows = @(); $summary = @(); $patchRows = @()
 $wafCache = @{}; $wafUse = @{}
 function New-UnknownWaf([string]$PolicyId, [string]$Kind) {
-    [pscustomobject]@{ policyId = $PolicyId; policy = (Get-LastSegment $PolicyId); kind = $Kind; state = 'unknown'; mode = ''; verdict = 'UNKNOWN (policy not visible)'
+    [pscustomobject]@{ policyId = $PolicyId; policy = (Get-ResourceName $PolicyId); kind = $Kind; state = 'unknown'; mode = ''; verdict = 'UNKNOWN (policy not visible)'
         requestBodyCheck = ''; managedRuleSets = ''; disabledRules = ''; disabledRuleGroups = ''; weakenedRules = ''; exclusions = ''; customRules = ''; permissiveAllows = ''
         allowlist = $false; allowlistClass = ''; notes = 'the WAF policy resource is not readable with this account'; customRuleRows = @() }
 }
@@ -872,8 +884,9 @@ foreach ($a in $apim) {
     $reach = Get-ApimReach "$($a.vnetType)" "$($a.publicAccess)" $peCount $class443 $class3443 $hasNsg
     if ($unchecked) { $reach.management = 'UNKNOWN (subnet or NSG not visible)'; if ($a.vnetType -ieq 'External') { $reach.gateway = 'UNKNOWN (subnet or NSG not visible)' } }
     elseif ($notVisible.Count) { $reach.management += " (not checked: $($notVisible -join ', '))"; if ($a.vnetType -ieq 'External') { $reach.gateway += " (not checked: $($notVisible -join ', '))" } }
-    # Consumption and v2 tiers have no dedicated service configuration endpoint on 3443
-    $dedicatedMgmt = $sc.tierFamily -eq 'Classic'
+    # Consumption and v2 tiers have no dedicated service configuration endpoint on 3443. An unrecognized SKU is
+    # analysed as if it had one (it is retained for review; the scope reason says so).
+    $dedicatedMgmt = $sc.tierFamily -in 'Classic', 'Unknown'
     if (-not $dedicatedMgmt) { $reach.management = "n/a ($($sc.tierFamily): no dedicated management endpoint on 3443)" }
 
     # ---- Global policy: ip-filter allowlists and the X-Azure-FDID check ----
@@ -958,7 +971,7 @@ foreach ($a in $apim) {
                 } else { $cls = 'VNET'; $src = 'private frontend (VNet only)' }
                 $bypass = if ($waf -and $wafVerdict -eq 'PREVENTION' -and $fe -and $fe.public) { Test-WafBypass $gwEffective $fdid $policyAllow } else { $false }
                 $frontendText = "$(if ($fe) { $fe.address }):$port$(if ($hostText) { " ($hostText)" })"
-                $detail = "listener $($l.name) -> rule $($rr.name)$(if ($h.paths) { " paths $($h.paths)" }) -> pool $(Get-LastSegment $h.poolId) ($($matchedPools["$($h.poolId)".ToLower()]))$(if ($bypass) { $bypassText })"
+                $detail = "listener $($l.name) -> rule $($rr.name)$(if ($h.paths) { " paths $($h.paths)" }) -> pool $(Get-ResourceName $h.poolId) ($($matchedPools["$($h.poolId)".ToLower()]))$(if ($bypass) { $bypassText })"
                 $pathways += New-Pathway $a 'Application Gateway' $gw.name $gw.id $matchedPools["$($h.poolId)".ToLower()] $frontendText "$port" $src $cls $waf $wafVerdict $bypass $detail
             }
         }
@@ -998,7 +1011,7 @@ foreach ($a in $apim) {
                 $waf = if ($policyId) { Get-WafFor $policyId 'FrontDoor' $a.name } else { $null }
                 $wafVerdict = if ($waf) { $waf.verdict } else { 'NO WAF' }
                 $bypass = if ($waf -and $wafVerdict -eq 'PREVENTION') { Test-WafBypass $gwEffective $fdid $policyAllow } else { $false }
-                $hostName = if ($domainHost.ContainsKey("$did".ToLower())) { $domainHost["$did".ToLower()] } else { Get-LastSegment $did }
+                $hostName = if ($domainHost.ContainsKey("$did".ToLower())) { $domainHost["$did".ToLower()] } else { Get-ResourceName $did }
                 $detail = "route $($rt.name) patterns $(@($rp.patternsToMatch) -join ' ') -> origin $($og.origin)$(if ($og.privateLink) { ' over Private Link' })$(if ($bypass) { $bypassText })"
                 $pathways += New-Pathway $a 'Front Door' $entry.profile.name $entry.profile.id $og.endpoint $hostName '443/80' 'internet (Front Door anycast edge)' 'OPEN' $waf $wafVerdict $bypass $detail
             }
@@ -1031,7 +1044,7 @@ foreach ($a in $apim) {
                 $waf = if ($policyId) { Get-WafFor $policyId 'FrontDoor' $a.name } else { $null }
                 $wafVerdict = if ($waf) { $waf.verdict } else { 'NO WAF' }
                 $bypass = if ($waf -and $wafVerdict -eq 'PREVENTION') { Test-WafBypass $gwEffective $fdid $policyAllow } else { $false }
-                $detail = "routing rule $($rr.name) patterns $(@($rp.patternsToMatch) -join ' ') -> pool $(Get-LastSegment $poolId)$(if ($bypass) { $bypassText })"
+                $detail = "routing rule $($rr.name) patterns $(@($rp.patternsToMatch) -join ' ') -> pool $(Get-ResourceName $poolId)$(if ($bypass) { $bypassText })"
                 $pathways += New-Pathway $a 'Front Door (classic)' $fd.name $fd.id $matchedPools[$poolId.ToLower()] $feHost[$k] '443/80' 'internet (Front Door anycast edge)' 'OPEN' $waf $wafVerdict $bypass $detail
             }
         }
@@ -1064,7 +1077,7 @@ foreach ($a in $apim) {
         $polId = "$($fwp.firewallPolicy.id)"; $seen = @{}
         while ($polId -and -not $seen.ContainsKey($polId.ToLower())) {
             $seen[$polId.ToLower()] = $true
-            foreach ($nr in @($fwPolicyNat[$polId.ToLower()])) { $natRules += [pscustomobject]@{ collection = "$(Get-LastSegment $polId)/$($nr.collection)"; rule = $nr.rule } }
+            foreach ($nr in @($fwPolicyNat[$polId.ToLower()])) { $natRules += [pscustomobject]@{ collection = "$(Get-ResourceName $polId)/$($nr.collection)"; rule = $nr.rule } }
             $polId = if ($fwPolicyById.ContainsKey($polId.ToLower())) { "$($fwPolicyById[$polId.ToLower()].basePolicyId)" } else { '' }
         }
         foreach ($n in $natRules) {
@@ -1084,7 +1097,7 @@ foreach ($a in $apim) {
     foreach ($pe in $privateEndpoints) {
         foreach ($c in @(@(Expand-Json $pe.connections) + @(Expand-Json $pe.manualConnections) | Where-Object { $_ })) {
             if ("$($c.properties.privateLinkServiceId)" -ine "$($a.id)") { continue }
-            $pathways += New-Pathway $a 'private endpoint' $pe.name $pe.id 'gateway (Private Link)' (Get-LastSegment $pe.subnetId) '443' 'the VNet of the private endpoint' 'PRIVATE' $null 'n/a' $false "connection $($c.name): $($c.properties.privateLinkServiceConnectionState.status)"
+            $pathways += New-Pathway $a 'private endpoint' $pe.name $pe.id 'gateway (Private Link)' (Get-ResourceName $pe.subnetId) '443' 'the VNet of the private endpoint' 'PRIVATE' $null 'n/a' $false "connection $($c.name): $($c.properties.privateLinkServiceConnectionState.status)"
         }
     }
 

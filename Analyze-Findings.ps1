@@ -233,7 +233,7 @@ if (-not $SkipLive) {
 }
 # Internet ingress (optional input from Check-IngressExposure.ps1)
 $ingressFile = Join-Path $IngressDir 'ingress-summary.csv'
-$ingress = if (Test-Path $ingressFile) { @(Import-Csv $ingressFile | Where-Object { $_.apim -in $scopeNames }) } else { @() }
+$ingress = if (Test-Path -LiteralPath $ingressFile) { @(Read-Csv $ingressFile @('apim', 'ingressStatus', 'managementReach', 'wafVerdicts', 'wafBypassable') | Where-Object { $_.apim -in $scopeNames }) } else { @() }
 if ($ingress.Count) {
     Write-Host "Internet ingress from $ingressFile ($($ingress.Count) instances)"
     foreach ($r in $ingress | Where-Object { $_.managementReach -like 'INTERNET*' -or $_.managementReach -like 'BROAD*' -or $_.managementReach -like 'AZURE-SHARED*' }) {
@@ -291,9 +291,13 @@ if ($oids.Count -and -not $SkipLive) {
 
     # Azure public IP ranges (service tag AzureCloud), to tell cloud-hosted callers from others
     $azureNets = @()
-    $account = Invoke-AzJson @('account', 'show')
-    if (-not $account.id) { throw 'Azure CLI account show returned no subscription ID.' }
-    $sub = $account.id
+    # Any readable subscription will do. An in-scope instance's subscription is in the tenant the token is for, also with -TenantId.
+    $sub = @($classic | Where-Object { $_.subscriptionId } | ForEach-Object { "$($_.subscriptionId)" })
+    $sub = if ($sub.Count) { $sub[0] } else {
+        $account = Invoke-AzJson @('account', 'show')
+        if (-not $account.id) { throw 'Azure CLI account show returned no subscription ID.' }
+        "$($account.id)"
+    }
     $st = Invoke-Api GET "https://management.azure.com/subscriptions/$sub/providers/Microsoft.Network/locations/westeurope/serviceTags?api-version=2023-09-01"
     if ($st.ok) {
         $prefixes = @(($st.data.values | Where-Object { $_.name -eq 'AzureCloud' }).properties.addressPrefixes) | Where-Object { $_ -notmatch ':' }

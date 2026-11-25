@@ -285,6 +285,8 @@ Describe 'Offline three-script workflow' {
         Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq "Tenant $($global:ApimWorkflowFixture.tenantId): searching 1 subscription(s)..." }
         Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -like '*/subscriptions/dddddddd-*' -or $Uri -like '*/subscriptions/eeeeeeee-*' -or $Uri -like '*/subscriptions/22222222-*' }
         @(Import-Csv '.\apim-exposure\subscription-access.csv').Count | Should -Be 1
+        Should -Invoke az -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -contains '--tenant' -and $Arguments -contains '11111111-1111-1111-1111-111111111111' }
+        Should -Invoke az -Times 0 -Exactly -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -notcontains '--tenant' }
     }
 
     It 'reads the tenant named by -TenantId and requests its tokens for that tenant' {
@@ -301,5 +303,34 @@ Describe 'Offline three-script workflow' {
         Write-TestCallerInput
         & (Join-Path $repo 'Analyze-Findings.ps1') -TenantId '22222222-2222-2222-2222-222222222222'
         Should -Invoke az -ParameterFilter { $Arguments -contains 'get-access-token' -and $Arguments -contains '--tenant' -and $Arguments -contains '22222222-2222-2222-2222-222222222222' }
+    }
+
+    It 'joins the ingress summary to the analysis, flags the weak instances and compares ingress status between runs' {
+        & (Join-Path $repo 'Check-ApimExposure.ps1')
+        New-Item -ItemType Directory '.\ingress-exposure' -Force | Out-Null
+        @(
+            [pscustomobject]@{ apim = 'apim-developer'; ingressStatus = 'OPEN'; vnetType = 'Internal'; publicAccess = 'Enabled'; managementReach = 'INTERNET (NSG allows 3443 from Internet)'; gatewayReach = 'INTERNET'; wafVerdicts = 'DETECTION ONLY; PREVENTION'; wafBypassable = 'True'; ipFilter = 'none'; fdidCheck = 'False' }
+            [pscustomobject]@{ apim = 'apim-premium'; ingressStatus = 'PRIVATE'; vnetType = 'Internal'; publicAccess = 'Enabled'; managementReach = 'CONTROL-PLANE ONLY'; gatewayReach = 'PRIVATE'; wafVerdicts = 'PREVENTION'; wafBypassable = 'False'; ipFilter = 'none'; fdidCheck = 'True' }
+            [pscustomobject]@{ apim = 'apim-basicv2'; ingressStatus = 'OPEN'; vnetType = 'None'; publicAccess = 'Enabled'; managementReach = 'n/a'; gatewayReach = 'INTERNET'; wafVerdicts = ''; wafBypassable = 'False'; ipFilter = 'none'; fdidCheck = 'False' }
+        ) | Export-Csv '.\ingress-exposure\ingress-summary.csv'
+        & (Join-Path $repo 'Analyze-Findings.ps1') -SkipLive
+        $flags = @(Import-Csv '.\incident-analysis\flags.csv')
+        @($flags | Where-Object { $_.kind -eq 'Management endpoint reachable from the internet' } | ForEach-Object { $_.apim }) | Should -Be @('apim-developer')
+        @($flags | Where-Object { $_.kind -eq 'WAF bypassable or not in prevention mode' } | ForEach-Object { $_.apim }) | Should -Be @('apim-developer')
+        $report = Get-Content '.\incident-analysis\analysis-report.md' -Raw
+        $report | Should -Match '\| Instances with OPEN internet ingress \| 1 '
+        $report | Should -Match '## Internet ingress'
+        $snapshot = Get-Content '.\incident-analysis\snapshot.json' -Raw | ConvertFrom-Json
+        @($snapshot.ingress).Count | Should -Be 2   # the v2 instance is out of scope and left out
+        # Second run after locking the instance down: the comparison reports the ingress change and the resolved flags
+        (Import-Csv '.\ingress-exposure\ingress-summary.csv') | ForEach-Object {
+            if ($_.apim -eq 'apim-developer') { $_.ingressStatus = 'FILTERED'; $_.managementReach = 'CONTROL-PLANE ONLY'; $_.wafVerdicts = 'PREVENTION'; $_.wafBypassable = 'False' }
+            $_
+        } | Export-Csv '.\ingress-exposure\ingress-summary.csv'
+        & (Join-Path $repo 'Analyze-Findings.ps1') -SkipLive -OutDir '.\incident-analysis-2' -CompareTo '.\incident-analysis'
+        $report2 = Get-Content '.\incident-analysis-2\analysis-report.md' -Raw
+        $report2 | Should -Match "Ingress: apim-developer changed from 'OPEN' to 'FILTERED'"
+        $report2 | Should -Match 'Flag: resolved - Management endpoint reachable from the internet\|apim-developer'
+        $report2 | Should -Match 'Flag: resolved - WAF bypassable or not in prevention mode\|apim-developer'
     }
 }

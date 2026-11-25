@@ -32,7 +32,7 @@ Without that list, the script falls back to a rule: **Classic dedicated tiers** 
 - **Consumption** (multi-tenant platform `mtv1`) is out of scope by default. Microsoft's notice names it among the Classic tiers, but in the tenants checked so far Microsoft's impacted-resources list included only dedicated-tier instances. Add `-IncludeConsumption` to include it anyway.
 - **Platform version** is shown but not used. Instances on `stv2.1` were listed as impacted.
 
-All three scripts share these explicit SKU rules in `Apim-Helpers.ps1`:
+All four analysis scripts share these explicit SKU rules in `Apim-Helpers.ps1`:
 
 | SKU | Family | Fallback scope |
 |---|---|---|
@@ -73,7 +73,7 @@ Malformed, duplicate or unrecognized `inScope` values stop the run rather than s
 - Keep `Apim-Helpers.ps1` alongside the entry scripts; clone/download the repository rather than copying one script alone
 - Azure CLI (`az`), signed in with `az login`
 - **Reader** on the subscriptions you want to cover (the ingress script also reads NSGs, gateways, Front Doors, firewalls and the APIM global policy, all covered by Reader)
-- One tenant per run: the scripts read the enabled subscriptions of the current `az` tenant and list the subscriptions they skip in other tenants. For another tenant, run `az login --tenant <id>` and pass `-TenantId <id>`
+- One tenant per run: the scripts read the enabled subscriptions of the current `az` tenant and say how many subscriptions they skip in each other tenant. For another tenant, run `az login --tenant <id>` and pass `-TenantId <id>`
 - For the audit script: **Log Analytics Reader** on the workspaces that hold Key Vault logs
 - For the follow-up analysis: also directory read access in Entra ID, to resolve object IDs
 
@@ -172,7 +172,7 @@ These are indicators, not proof. A stolen credential used with the same tool wou
 - **Secret types** are inferred from display names.
 - **Backends** are checked for credential structure only. Credential values returned by the management API are inspected in memory to count literals and references; they are never printed or written out.
 
-**Comparing runs.** `-CompareTo` lists what changed since the earlier run's `snapshot.json`: instance status, vault verdicts, caller verdicts, flags and totals. Compare runs made in the same mode. A `-SkipLive` run has no backend, logger or caller data, so those show up as changes.
+**Comparing runs.** `-CompareTo` lists what changed since the earlier run's `snapshot.json`: instance status, ingress status, vault verdicts, caller verdicts, flags and totals. Compare runs made in the same mode. A `-SkipLive` run has no backend, logger or caller data, so those show up as changes.
 
 **Failed live checks.** If backend or logger enumeration fails, analysis stops with the failed URL and API error instead of treating inaccessible objects as an empty list. Resolve the error and rerun before relying on the output; files from an earlier or interrupted run may still be present.
 
@@ -207,7 +207,7 @@ These are indicators, not proof. A stolen credential used with the same tool wou
 
 ### Reading the ingress output
 
-`Check-IngressExposure.ps1` answers one question per instance: who on the internet can reach it, through what, and how permissive is each path. It uses `apim-exposure/scope.csv` when present (so it follows Microsoft's impacted-resources list), otherwise the tier rule; `-AllInstances` analyses everything.
+`Check-IngressExposure.ps1` answers one question per instance: who on the internet can reach it, through what, and how permissive is each path. It uses `apim-exposure/scope.csv` when present (so it follows Microsoft's impacted-resources list), validated the same way as the audit and analysis scripts do, otherwise the shared tier rule, under which an unrecognized SKU is retained and analysed like a Classic tier; `-AllInstances` analyses everything.
 
 Two endpoints matter for this incident:
 - **The management endpoint on port 3443**: the service configuration endpoint on every Classic instance's public VIP, used by Azure's control plane (and formerly by the direct management API). Microsoft's reference NSG rule allows it only from the `ApiManagement` service tag.
@@ -225,7 +225,7 @@ Two endpoints matter for this incident:
 | `PRIVATE` | Nothing beyond the Azure control plane, the VNet or private ranges. |
 | `UNCHECKED` | The APIM subnet or its NSG could not be read. |
 
-`managementReach` and `gatewayReach` say where each endpoint can be reached from. `CONTROL-PLANE ONLY` on the management endpoint means only Microsoft-operated service tags are admitted; Microsoft's reference is the `ApiManagement` tag, and any other control-plane tag on 3443 is listed for review. Consumption and v2 instances have no dedicated 3443 endpoint and show `n/a` there. In VNet modes the answer comes from the NSG on the APIM subnet (every location of a multi-region instance); without a VNet it comes from `publicNetworkAccess` and the private endpoints. Whether disabling public network access also closes the developer portal, Git and management hostnames is not documented by Microsoft; the script treats it as closing them and says so.
+`managementReach` and `gatewayReach` say where each endpoint can be reached from. `CONTROL-PLANE ONLY` on the management endpoint means only Microsoft-operated service tags are admitted; Microsoft's reference is the `ApiManagement` tag, and any other control-plane tag on 3443 is listed for review. Consumption and v2 instances have no dedicated 3443 endpoint and show `n/a` there; an instance with an unrecognized SKU is analysed as if it had one, and its `tierFamily` says `Unknown`. In VNet modes the answer comes from the NSG on the APIM subnet (every location of a multi-region instance); without a VNet it comes from `publicNetworkAccess` and the private endpoints. Whether disabling public network access also closes the developer portal, Git and management hostnames is not documented by Microsoft; the script treats it as closing them and says so.
 
 **Pathways** (`ingress-pathways.csv`, one row per way in): `direct (public VIP)`, `Application Gateway` (listener to backend pool, with the most specific WAF policy: path rule, then listener, then gateway, then the inline configuration; the gateway subnet's NSG refines the source class), `Front Door` and `Front Door (classic)` (origin or backend to route and domain, with the security policy's WAF), `Traffic Manager` (DNS only; exposure equals the target's own), `Azure Firewall DNAT` (rule sources, IP groups expanded) and `private endpoint`. `bypassable` is true when a WAF fronts the gateway but the instance also answers directly from the internet and neither checks `X-Azure-FDID` nor filters source addresses.
 
