@@ -376,12 +376,105 @@ Describe 'WAF bypass and instance status' {
 }
 
 Describe 'Get-GatewayPatchStatus (NSM thresholds)' {
-    It 'rates <Version> as <Expected>' -TestCases @(
-        @{ Version = '0.52.31936.0'; Expected = 'patched*' }, @{ Version = '0.52.31935.0'; Expected = 'NOT PATCHED*' }
-        @{ Version = '0.53.31938.0'; Expected = 'patched*' }, @{ Version = '0.53.31000.0'; Expected = 'NOT PATCHED*' }
-        @{ Version = '0.53.4608.0'; Expected = 'NOT PATCHED*' }, @{ Version = '0.54.1.0'; Expected = 'not applicable*' }
-        @{ Version = ''; Expected = 'unknown*' }
-    ) { Get-GatewayPatchStatus $Version | Should -BeLike $Expected }
+    It 'rates <Version> on a <Tier> tier as <Expected>' -TestCases @(
+        @{ Version = '0.52.31936.0'; Tier = 'Classic'; Expected = 'patched*' }, @{ Version = '0.52.31935.0'; Tier = 'Classic'; Expected = 'NOT PATCHED*' }
+        @{ Version = '0.53.31938.0'; Tier = 'Classic'; Expected = 'patched*' }, @{ Version = '0.53.31000.0'; Tier = 'Classic'; Expected = 'NOT PATCHED*' }
+        @{ Version = '0.52.40000'; Tier = 'Classic'; Expected = 'patched*' }
+        # NSM's own examples of the v2 / Consumption pattern: never NOT PATCHED, on a Classic SKU a case for Microsoft
+        @{ Version = '0.53.4608.0'; Tier = 'Classic'; Expected = 'UNRECOGNISED*v2 / Consumption*' }
+        @{ Version = '0.52.4150.0'; Tier = 'Classic'; Expected = 'UNRECOGNISED*v2 / Consumption*' }
+        @{ Version = '0.53.4608.0'; Tier = 'Classic (Consumption)'; Expected = 'not applicable*' }
+        @{ Version = '0.52.4150.0'; Tier = 'v2'; Expected = 'not applicable*' }
+        @{ Version = ''; Tier = 'v2'; Expected = 'not applicable*' }
+        @{ Version = '0.54.1.0'; Tier = 'Classic'; Expected = 'UNRECOGNISED*outside*' }
+        @{ Version = '0.5.31936.0'; Tier = 'Classic'; Expected = 'UNRECOGNISED*' }
+        @{ Version = '0.521.31936.0'; Tier = 'Classic'; Expected = 'UNRECOGNISED*' }
+        @{ Version = '0.53.31938.0'; Tier = 'Unknown'; Expected = 'patched*' }
+        @{ Version = ''; Tier = 'Classic'; Expected = 'unknown*' }
+    ) { Get-GatewayPatchStatus $Version $Tier | Should -BeLike $Expected }
+    It 'names the threshold a NOT PATCHED build needs' { Get-GatewayPatchStatus '0.53.31937.0' 'Classic' | Should -Be 'NOT PATCHED (0.53.31937.0; needs 0.53.31938 or later)' }
+    It 'defaults to the Classic rule' { Get-GatewayPatchStatus '0.52.31935.0' | Should -BeLike 'NOT PATCHED*' }
+}
+
+Describe 'Gateway probe targets and the per-instance patch summary' {
+    It 'probes only the default hostname of a single-region instance' {
+        $t = @(Get-GatewayProbeTargets ([pscustomobject]@{ name = 'apim-one'; location = 'westeurope'; additionalLocations = @(); gatewayRegionalUrl = 'https://apim-one-westeurope-01.regional.azure-api.net' }))
+        $t.Count | Should -Be 1
+        $t[0].host | Should -Be 'apim-one.azure-api.net'
+    }
+    It 'adds every regional gateway of a multi-region instance and keeps disabled regions unprobed' {
+        $apim = [pscustomobject]@{ name = 'apim-multi'; location = 'westeurope'; gatewayRegionalUrl = 'https://apim-multi-westeurope-01.regional.azure-api.net'; disableGateway = 'false'
+            additionalLocations = @(
+                [pscustomobject]@{ location = 'northeurope'; gatewayRegionalUrl = 'https://apim-multi-northeurope-01.regional.azure-api.net'; disableGateway = $false }
+                [pscustomobject]@{ location = 'swedencentral'; gatewayRegionalUrl = 'https://apim-multi-swedencentral-01.regional.azure-api.net'; disableGateway = $true }
+            ) }
+        $t = @(Get-GatewayProbeTargets $apim)
+        $t.Count | Should -Be 4
+        $t.host | Should -Contain 'apim-multi.azure-api.net'
+        $t.host | Should -Contain 'apim-multi-westeurope-01.regional.azure-api.net'
+        $t.host | Should -Contain 'apim-multi-northeurope-01.regional.azure-api.net'
+        ($t | Where-Object region -eq 'swedencentral').disabled | Should -BeTrue
+        ($t | Where-Object region -eq 'northeurope').disabled | Should -BeFalse
+        ($t | Where-Object region -eq 'westeurope').disabled | Should -BeFalse
+    }
+    It 'reads additional locations from Resource Graph JSON text' {
+        $apim = [pscustomobject]@{ name = 'apim-json'; location = 'westeurope'; gatewayRegionalUrl = 'https://apim-json-westeurope-01.regional.azure-api.net'
+            additionalLocations = '[{"location":"northeurope","gatewayRegionalUrl":"https://apim-json-northeurope-01.regional.azure-api.net","disableGateway":false}]' }
+        @(Get-GatewayProbeTargets $apim).Count | Should -Be 3
+    }
+    It 'summarises <Case>' -TestCases @(
+        @{ Case = 'all patched'; In = @('patched (0.52.31936.0)', 'patched (0.52.31940.0)'); Expected = 'patched (all 2 gateway(s))' }
+        @{ Case = 'one region behind'; In = @('patched (0.52.31936.0)', 'NOT PATCHED (0.52.31000.0; needs 0.52.31936 or later)'); Expected = 'NOT PATCHED in 1 of 2 gateway(s)*' }
+        @{ Case = 'one region unreadable'; In = @('patched (0.52.31936.0)', 'unknown (status endpoint not reachable from here: x)'); Expected = 'unknown in 1 of 2 gateway(s)*' }
+        @{ Case = 'an unrecognised build'; In = @('patched (0.52.31936.0)', 'UNRECOGNISED (0.54.1.0): x'); Expected = 'UNRECOGNISED in 1 of 2*' }
+        @{ Case = 'a disabled region'; In = @('patched (0.52.31936.0)', 'not probed (gateway disabled in this region)'); Expected = 'patched (all 1 gateway(s))' }
+        @{ Case = 'a v2 instance'; In = @('not applicable (v2 tier: not vulnerable per NSM)'); Expected = 'not applicable*' }
+    ) { Get-PatchSummary $In | Should -BeLike $Expected }
+    It 'never calls unprobed gateways patched' { Get-PatchSummary @('not probed (gateway disabled in this region)') | Should -BeLike 'not probed*' }
+}
+
+Describe 'Change history (Activity Log)' {
+    BeforeAll {
+        $script:apimId = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a'
+        $script:nsgId = '/subscriptions/s1/resourceGroups/rg-net/providers/Microsoft.Network/networkSecurityGroups/nsg-apim'
+        $script:watch = @($script:nsgId, '/subscriptions/s1/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/vnet/subnets/snet-apim')
+        function New-Event([string]$Op, [string]$ResourceId, [string]$Status = 'Succeeded') {
+            [pscustomobject]@{ operationName = [pscustomobject]@{ value = $Op }; status = [pscustomobject]@{ value = $Status }; resourceId = $ResourceId; eventTimestamp = '2026-11-20T10:00:00Z' }
+        }
+    }
+    It 'counts <Case>' -TestCases @(
+        @{ Case = 'an NSG rule change (child of the NSG, different case)'; Op = 'Microsoft.Network/networkSecurityGroups/securityRules/write'; Rid = '/SUBSCRIPTIONS/s1/resourceGroups/RG-NET/providers/Microsoft.Network/networkSecurityGroups/nsg-apim/securityRules/AllowMgmt' }
+        @{ Case = 'an NSG rule deletion'; Op = 'Microsoft.Network/networkSecurityGroups/securityRules/delete'; Rid = '/subscriptions/s1/resourceGroups/rg-net/providers/Microsoft.Network/networkSecurityGroups/nsg-apim/securityRules/AllowAll' }
+        @{ Case = 'a subnet change (NSG association)'; Op = 'Microsoft.Network/virtualNetworks/subnets/write'; Rid = '/subscriptions/s1/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/vnet/subnets/snet-apim' }
+        @{ Case = 'a service update (VNet mode, public access)'; Op = 'Microsoft.ApiManagement/service/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a' }
+        @{ Case = 'the global policy'; Op = 'Microsoft.ApiManagement/service/policies/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/policies/policy' }
+        @{ Case = 'tenant access (direct management API)'; Op = 'Microsoft.ApiManagement/service/tenant/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/tenant/access' }
+        @{ Case = 'a private endpoint connection'; Op = 'Microsoft.ApiManagement/service/privateEndpointConnections/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/privateEndpointConnections/pe1' }
+        @{ Case = 'applying a network configuration update'; Op = 'Microsoft.ApiManagement/service/applynetworkconfigurationupdates/action'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a' }
+    ) { Test-IngressChange (New-Event $Op $Rid) $script:apimId $script:watch | Should -BeTrue }
+    It 'ignores <Case>' -TestCases @(
+        @{ Case = 'an API deployment'; Op = 'Microsoft.ApiManagement/service/apis/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/apis/orders'; Status = 'Succeeded' }
+        @{ Case = 'an API-level policy'; Op = 'Microsoft.ApiManagement/service/apis/policies/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/apis/orders/policies/policy'; Status = 'Succeeded' }
+        @{ Case = 'the Started event of a write'; Op = 'Microsoft.Network/networkSecurityGroups/securityRules/write'; Rid = '/subscriptions/s1/resourceGroups/rg-net/providers/Microsoft.Network/networkSecurityGroups/nsg-apim/securityRules/x'; Status = 'Started' }
+        @{ Case = 'a failed write'; Op = 'Microsoft.Network/networkSecurityGroups/write'; Rid = '/subscriptions/s1/resourceGroups/rg-net/providers/Microsoft.Network/networkSecurityGroups/nsg-apim'; Status = 'Failed' }
+        @{ Case = 'a read-type action'; Op = 'Microsoft.ApiManagement/service/tenant/listSecrets/action'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/tenant/access'; Status = 'Succeeded' }
+        @{ Case = 'another NSG whose name starts the same'; Op = 'Microsoft.Network/networkSecurityGroups/write'; Rid = '/subscriptions/s1/resourceGroups/rg-net/providers/Microsoft.Network/networkSecurityGroups/nsg-apim-test'; Status = 'Succeeded' }
+        @{ Case = 'another instance whose name starts the same'; Op = 'Microsoft.ApiManagement/service/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-ab'; Status = 'Succeeded' }
+    ) { Test-IngressChange (New-Event $Op $Rid $Status) $script:apimId $script:watch | Should -BeFalse }
+    It 'builds one encoded Activity Log query per resource group' {
+        $u = Get-ActivityLogUrl 's1' 'rg-net' ([datetime]::new(2026, 11, 1, 0, 0, 0, 'Utc')) ([datetime]::new(2026, 11, 26, 8, 30, 0, 'Utc'))
+        $u | Should -BeLike 'https://management.azure.com/subscriptions/s1/providers/Microsoft.Insights/eventtypes/management/values?api-version=2015-04-01&$filter=*'
+        $u | Should -Not -Match ' '
+        [uri]::UnescapeDataString($u) | Should -Match "eventTimestamp ge '2026-11-01T00:00:00Z' and eventTimestamp le '2026-11-26T08:30:00Z' and resourceGroupName eq 'rg-net'"
+    }
+    It 'keys resource groups by subscription, case-insensitively' {
+        Get-ResourceGroupKey '/subscriptions/S1/resourceGroups/RG-Net/providers/x/y/z' | Should -Be 's1|rg-net'
+        Get-ResourceGroupKey 'not-an-id' | Should -Be ''
+    }
+    It 'formats timestamps as sortable UTC text' {
+        Format-EventTime ([datetime]::new(2026, 11, 20, 10, 0, 0, 'Utc')) | Should -Be '2026-11-20T10:00:00Z'
+        Format-EventTime '2026-11-20T10:00:00Z' | Should -Be '2026-11-20T10:00:00Z'
+    }
 }
 
 Describe 'Deny shadowing needs full destination cover and all source ports' {

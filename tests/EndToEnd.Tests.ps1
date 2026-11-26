@@ -59,7 +59,17 @@ BeforeAll {
         }
         throw "unexpected Resource Graph query: $Query"
     }
+    # Activity Log: the fixture's events for the queried resource group; $script:activityFailRg simulates an unreadable one
+    $script:activityFailRg = ''
+    $script:activityQueries = [System.Collections.Generic.List[string]]::new()
     function Get-Paged([string]$Url) {
+        if ($Url -match '/providers/Microsoft\.Insights/eventtypes/management/values\?') {
+            $script:activityQueries.Add($Url)
+            if ([uri]::UnescapeDataString($Url) -notmatch "resourceGroupName eq '([^']+)'") { throw "Activity Log query without a resource group: $Url" }
+            $rg = $Matches[1]
+            if ($rg -ieq $script:activityFailRg) { $script:failures += [pscustomobject]@{ url = $Url; error = 'HTTP 403 AuthorizationFailed' }; return }
+            return @($script:fixture.activityLog | Where-Object { "$($_.resourceId)" -match "/resourceGroups/$([regex]::Escape($rg))/" })
+        }
         $c = $script:fixture.afdChildren
         if ($Url -match '/afdEndpoints\?') { return @($c.endpoints) }
         if ($Url -match '/originGroups\?') { return @($c.originGroups) }
@@ -80,12 +90,15 @@ BeforeAll {
         throw "unexpected ARM get: $Url"
     }
     # Runs the main flow with the script's parameters as local variables; console output goes to console.txt
-    function Invoke-IngressFlow([string]$OutDir, [switch]$AllInstances, [switch]$IncludeConsumption, [string]$TenantId = '', [string]$ExposureDir = '') {
+    function Invoke-IngressFlow([string]$OutDir, [switch]$AllInstances, [switch]$IncludeConsumption, [string]$TenantId = '', [string]$ExposureDir = '',
+                                [switch]$CheckGatewayPatch, [switch]$SkipChangeHistory, [datetime]$ChangesSince = '2026-11-01') {
         if (-not $ExposureDir) { $ExposureDir = Join-Path $OutDir 'no-exposure-dir' }   # no scope.csv there, so the tier rule applies
-        $TightPrefixLength = 24; $TightPrefixLengthV6 = 48; $SkipPolicy = $false; $CheckGatewayPatch = $false
+        $TightPrefixLength = 24; $TightPrefixLengthV6 = 48; $SkipPolicy = $false
+        $script:failures = @()
         New-Item -ItemType Directory -Force $OutDir | Out-Null
         . ([scriptblock]::Create($script:flow)) *> (Join-Path $OutDir 'console.txt')
-        [pscustomobject]@{ summary = @($summary); pathways = @($pathways); nsgRows = @($nsgRows); policyRows = @($policyRows); wafPolicyRows = @($wafPolicyRows); outDir = $OutDir }
+        [pscustomobject]@{ summary = @($summary); pathways = @($pathways); nsgRows = @($nsgRows); policyRows = @($policyRows); wafPolicyRows = @($wafPolicyRows)
+                           patchRows = @($patchRows); changeRows = @($changeRows); outDir = $OutDir }
     }
 }
 
@@ -244,5 +257,88 @@ Describe 'End-to-end run with a scope file from Check-ApimExposure.ps1' {
         [pscustomobject]@{ id = '/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-none-open'; inScope = 'maybe' } |
             Export-Csv (Join-Path $bad 'scope.csv')
         { Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'scoped-bad') -ExposureDir $bad } | Should -Throw '*Expected True or False*'
+    }
+}
+
+Describe 'End-to-end run: change history since the exposure window' {
+    BeforeAll {
+        $script:activityFailRg = ''
+        $script:hist = Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'history')
+        $script:hs = @{}; foreach ($s in $script:hist.summary) { $script:hs[$s.apim] = $s }
+    }
+    It 'flags an NSG rule change on the APIM subnet, once, in its own case-insensitive resource group' {
+        $script:hs['apim-internal-3443-open'].changesSince | Should -BeLike 'CHANGED: 1 change(s) since 2026-11-01, last 2026-11-20T09:15:30Z'
+        $rows = @($script:hist.changeRows | Where-Object apim -eq 'apim-internal-3443-open')
+        $rows.Count | Should -Be 1
+        $rows[0].operation | Should -Be 'Microsoft.Network/networkSecurityGroups/securityRules/write'
+        $rows[0].caller | Should -Be 'admin@contoso.test'
+    }
+    It 'flags a service update on an instance without a VNet' {
+        $script:hs['apim-none-open'].changesSince | Should -BeLike 'CHANGED: 1 change(s)*2026-11-19T14:00:00Z'
+    }
+    It 'flags a change to a WAF policy in front of the instance' {
+        $script:hs['apim-internal-locked'].changesSince | Should -BeLike 'CHANGED: 1 change(s)*'
+        ($script:hist.changeRows | Where-Object apim -eq 'apim-internal-locked').resource | Should -Be 'waffdprevention'
+    }
+    It 'ignores API deployments and failed writes' {
+        $script:hs['apim-external-ref'].changesSince | Should -Be 'no changes since 2026-11-01'
+    }
+    It 'reads each resource group once' {
+        $script:activityQueries.Count | Should -Be (@($script:activityQueries | Sort-Object -Unique).Count)
+    }
+    It 'reports the changes in the report and network-changes.csv' {
+        $report = Get-Content (Join-Path $script:hist.outDir 'ingress-report.md') -Raw
+        $report | Should -Match '## Changes since 2026-11-01'
+        $report | Should -Match 'securityRules/write'
+        @(Import-Csv (Join-Path $script:hist.outDir 'network-changes.csv')).Count | Should -Be 3
+        Get-Content (Join-Path $script:hist.outDir 'console.txt') -Raw | Should -Match "3 instance\(s\) had ingress-relevant changes"
+    }
+    It 'says unknown, not "no changes", when the Activity Log cannot be read' {
+        $script:activityFailRg = 'rg-net'
+        try { $run = Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'history-fail') } finally { $script:activityFailRg = '' }
+        ($run.summary | Where-Object apim -eq 'apim-external-ref').changesSince | Should -Be 'unknown (Activity Log not readable for rg-net)'
+        ($run.summary | Where-Object apim -eq 'apim-none-open').changesSince | Should -BeLike 'CHANGED*'
+        Get-Content (Join-Path $run.outDir 'ingress-report.md') -Raw | Should -Match 'Activity Log not readable'
+    }
+    It 'skips the Activity Log with -SkipChangeHistory' {
+        $before = $script:activityQueries.Count
+        $run = Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'history-skip') -SkipChangeHistory
+        $script:activityQueries.Count | Should -Be $before
+        ($run.summary | Select-Object -First 1).changesSince | Should -Be 'not read (-SkipChangeHistory)'
+        Test-Path (Join-Path $run.outDir 'network-changes.csv') | Should -BeFalse
+    }
+}
+
+Describe 'End-to-end run with -CheckGatewayPatch' {
+    BeforeAll {
+        Mock Invoke-RestMethod {
+            if ($Uri -match 'apim-internal-') { throw 'No such host is known.' }
+            if ($Uri -match 'apim-external-ref') { return [pscustomobject]@{ RuntimeVersion = '0.52.31000.0' } }
+            if ($Uri -match 'apim-unknown-sku') { return [pscustomobject]@{ RuntimeVersion = '0.53.4608.0' } }
+            return [pscustomobject]@{ RuntimeVersion = '0.52.31936.0' }
+        }
+        $script:pr = Invoke-IngressFlow -OutDir (Join-Path $TestDrive 'patch') -CheckGatewayPatch -SkipChangeHistory -AllInstances
+        $script:ps = @{}; foreach ($s in $script:pr.summary) { $script:ps[$s.apim] = $s }
+    }
+    It 'rates each Classic gateway against the threshold' {
+        $script:ps['apim-none-open'].gatewayPatch | Should -Be 'patched (all 1 gateway(s))'
+        $script:ps['apim-external-ref'].gatewayPatch | Should -BeLike 'NOT PATCHED in 1 of 1 gateway(s)*0.52.31936*'
+    }
+    It 'tells the reader to rerun from inside the VNet for an Internal instance' {
+        $script:ps['apim-internal-locked'].gatewayPatch | Should -BeLike 'unknown in 1 of 1*'
+        ($script:pr.patchRows | Where-Object apim -eq 'apim-internal-locked').note | Should -Match 'inside \(or peered with\) the VNet'
+    }
+    It 'does not call NSM''s v2 / Consumption pattern NOT PATCHED on an unknown SKU' {
+        $script:ps['apim-unknown-sku'].gatewayPatch | Should -BeLike 'UNRECOGNISED*'
+    }
+    It 'does not probe v2 and Consumption instances' {
+        $script:ps['apim-v2-standard'].gatewayPatch | Should -BeLike 'not applicable (v2 tier*'
+        $script:ps['apim-consumption'].gatewayPatch | Should -BeLike 'not applicable (Classic (Consumption) tier*'
+        Should -Invoke Invoke-RestMethod -Times 0 -ParameterFilter { $Uri -match 'apim-v2-standard|apim-consumption' }
+    }
+    It 'writes one row per gateway with its region' {
+        $rows = @(Import-Csv (Join-Path $script:pr.outDir 'gateway-patch-status.csv'))
+        $rows.Count | Should -Be $script:pr.summary.Count
+        ($rows | Where-Object apim -eq 'apim-none-open').region | Should -BeLike '* (default hostname)'
     }
 }

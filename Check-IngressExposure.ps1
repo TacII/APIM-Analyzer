@@ -16,6 +16,10 @@ Scope: apim-exposure/scope.csv from Check-ApimExposure.ps1 when present (Microso
 the tier rule), validated as in the audit and analysis scripts; otherwise the shared tier rule, which retains an
 unrecognized SKU for review. -AllInstances analyses every instance you can see.
 
+Current state vs. the exposure window: everything above is today's configuration. The Activity Log is read for
+changes since -ChangesSince (default 1 Nov 2026) to the instance, its subnets and NSGs, and the front ends and WAF
+policies that reach it, so an instance that was locked down after the incident is flagged rather than looking safe.
+
 Author:  Tim Kidd (ingress analysis), building on the APIM incident tools by Mathias Haas, Fidelity Consulting AB
 License: MIT (see LICENSE). Provided as is, without warranty.
 #>
@@ -27,8 +31,10 @@ param(
     [switch]$IncludeConsumption,       # without a scope file: treat Consumption instances as in scope too
     [switch]$AllInstances,             # analyse every APIM instance, in scope or not
     [switch]$SkipPolicy,               # do not read APIM global policies (ip-filter / X-Azure-FDID checks)
-    [switch]$CheckGatewayPatch,        # also ask each gateway's status endpoint for its runtime build and compare with NSM's patched thresholds
-    [string]$TenantId                  # Entra tenant to read; default: the tenant of the current az account (subscriptions in other tenants are skipped)
+    [switch]$CheckGatewayPatch,        # also ask each gateway's status endpoint (every region) for its runtime build and compare with NSM's patched thresholds
+    [datetime]$ChangesSince = '2026-11-01',   # UTC; Activity Log changes to ingress-relevant resources since then are flagged (max 90 days back)
+    [switch]$SkipChangeHistory,        # do not read the Activity Log
+    [string]$TenantId                 # Entra tenant to read; default: the tenant of the current az account (subscriptions in other tenants are skipped)
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Apim-Helpers.ps1')
@@ -671,7 +677,8 @@ resources
     publicIPs = properties.publicIPAddresses, privateIPs = properties.privateIPAddresses,
     subnetId = tostring(properties.virtualNetworkConfiguration.subnetResourceId), publicIpId = tostring(properties.publicIpAddressId),
     hostnames = properties.hostnameConfigurations, additionalLocations = properties.additionalLocations,
-    gatewayUrl = tostring(properties.gatewayUrl), developerPortalStatus = tostring(properties.developerPortalStatus)
+    gatewayUrl = tostring(properties.gatewayUrl), developerPortalStatus = tostring(properties.developerPortalStatus),
+    gatewayRegionalUrl = tostring(properties.gatewayRegionalUrl), disableGateway = tostring(properties.disableGateway)
 "@ $subs)
 
 # Scope: scope.csv from Check-ApimExposure.ps1 when present, validated and applied by Select-ApimInstance as in the audit
@@ -775,20 +782,116 @@ function Expand-FirewallSources($Rule) {
 
 # Patch level of the gateway runtime, per the Norwegian NSM advisory of 20 Nov 2026 (NSM deler tiltak mot sårbarhet i
 # Azure API Management): https://<gateway>/internal-status-0123456789abcdef reports RuntimeVersion; 0.52.x is patched
-# from build 31936, 0.53.x from 31938; other patterns belong to v2/Consumption, which were not vulnerable. Microsoft
-# has not documented this endpoint, so an unreadable answer is 'unknown', never 'patched'.
-function Get-GatewayPatchStatus([string]$Version) {
+# from build 31936, 0.53.x from 31938. NSM gives builds such as 0.52.4150.0 and 0.53.4608.0 as "other patterns" of the
+# v2 / Consumption tiers, which were not vulnerable. So the verdict depends on the tier, not on the version alone:
+#   v2 / Consumption          not applicable (no probe needed)
+#   Classic, 5-digit build    patched / NOT PATCHED against the threshold
+#   Classic, short build      UNRECOGNISED: NSM's v2/Consumption pattern on a Classic SKU; verify with Microsoft
+#   anything but 0.52 / 0.53  UNRECOGNISED: outside NSM's thresholds; verify with Microsoft
+# Microsoft has not documented this endpoint, so an unreadable answer is 'unknown', never 'patched'.
+function Get-GatewayPatchStatus([string]$Version, [string]$TierFamily = 'Classic') {
+    if ($TierFamily -in 'v2', 'Classic (Consumption)') { return "not applicable ($TierFamily tier: not vulnerable per NSM)" }
     $v = "$Version".Trim()
     if (-not $v) { return 'unknown (no RuntimeVersion)' }
-    if ($v -match '^0\.52\.(\d+)') { if ([int]$Matches[1] -ge 31936) { return "patched ($v)" } else { return "NOT PATCHED ($v; needs 0.52.31936 or later)" } }
-    if ($v -match '^0\.53\.(\d+)') { if ([int]$Matches[1] -ge 31938) { return "patched ($v)" } else { return "NOT PATCHED ($v; needs 0.53.31938 or later)" } }
-    return "not applicable (${v}: v2/Consumption pattern per NSM)"
+    if ($v -notmatch '^0\.(52|53)\.(\d+)(\.|$)') { return "UNRECOGNISED ($v): outside NSM's 0.52 / 0.53 thresholds; verify with Microsoft" }
+    $minor = $Matches[1]; $build = [long]$Matches[2]
+    $need = if ($minor -eq '52') { 31936 } else { 31938 }
+    if ($build -ge $need) { return "patched ($v)" }
+    if ($build -lt 10000) { return "UNRECOGNISED ($v): NSM lists this build pattern for v2 / Consumption, but the tier is $TierFamily; verify with Microsoft" }
+    return "NOT PATCHED ($v; needs 0.$minor.$need or later)"
+}
+function Get-UrlHost([string]$Url) {
+    $u = $null
+    if ($Url -and [uri]::TryCreate($Url.Trim(), [UriKind]::Absolute, [ref]$u)) { return $u.Host }
+    return ''
+}
+# Gateways to probe for the runtime build. The default hostname is routed to the nearest region, so in a multi-region
+# deployment every region's own gateway (gatewayRegionalUrl) is probed as well: regions can run different builds.
+# A region whose gateway is disabled is listed but not probed.
+function Get-GatewayProbeTargets($Apim) {
+    $rows = @([pscustomobject]@{ region = "$($Apim.location) (default hostname)"; host = "$($Apim.name).azure-api.net"; disabled = $false })
+    $extra = @(Expand-Json $Apim.additionalLocations | Where-Object { $_ })
+    if ($extra.Count) {
+        $rows += [pscustomobject]@{ region = "$($Apim.location)"; host = (Get-UrlHost "$($Apim.gatewayRegionalUrl)"); disabled = ("$($Apim.disableGateway)" -ieq 'true') }
+        foreach ($l in $extra) {
+            $rows += [pscustomobject]@{ region = "$($l.location)"; host = (Get-UrlHost "$($l.gatewayRegionalUrl)"); disabled = ("$($l.disableGateway)" -ieq 'true') }
+        }
+    }
+    $rows
+}
+# One verdict per instance from its per-gateway statuses: the worst one wins, and 'patched' needs every probed gateway.
+function Get-PatchSummary([string[]]$Statuses) {
+    $all = @($Statuses | Where-Object { $_ })
+    $s = @($all | Where-Object { $_ -notlike 'not probed*' -and $_ -notlike 'not applicable*' })
+    if (-not $s.Count) { return $(if ($all.Count) { $all[0] } else { '' }) }
+    foreach ($p in 'NOT PATCHED', 'UNRECOGNISED', 'unknown') {
+        $hit = @($s | Where-Object { $_ -clike "$p*" })
+        if ($hit.Count) { return "$p in $($hit.Count) of $($s.Count) gateway(s): $($hit[0])" }
+    }
+    return "patched (all $($s.Count) gateway(s))"
+}
+
+# ---- Change history: was the configuration different during the exposure window? ----
+# Does an Activity Log event change how the instance can be reached? Only successful writes and deletes count.
+# $Watched: the instance's subnets and NSGs and the front ends and WAF policies that reach it; the resource and all its
+# children count (an NSG rule is a child of the NSG). For the instance itself only the service, its private endpoint
+# connections, the global policy (ip-filter / X-Azure-FDID) and the tenant access settings (direct management API, Git)
+# count: API, product and other content deployments do not change ingress.
+function Test-IngressChange($Event, [string]$ApimId, [string[]]$Watched) {
+    if ("$($Event.status.value)" -ine 'Succeeded') { return $false }
+    $op = "$($Event.operationName.value)"
+    if ($op -notmatch '/(write|delete)$' -and $op -notmatch '/applynetworkconfigurationupdates/action$') { return $false }
+    $rid = "$($Event.resourceId)".Trim().TrimEnd('/').ToLowerInvariant()
+    if (-not $rid) { return $false }
+    $a = "$ApimId".Trim().TrimEnd('/').ToLowerInvariant()
+    if ($a -and ($rid -eq $a -or $rid -eq "$a/policies/policy" -or $rid.StartsWith("$a/privateendpointconnections/") -or $rid.StartsWith("$a/tenant/"))) { return $true }
+    foreach ($w in @($Watched | Where-Object { $_ })) {
+        $wl = "$w".Trim().TrimEnd('/').ToLowerInvariant()
+        if ($rid -eq $wl -or $rid.StartsWith("$wl/")) { return $true }
+    }
+    return $false
+}
+# Activity Log query for one resource group (the API filters by resource group, not by a resource and its children)
+function Get-ActivityLogUrl([string]$SubscriptionId, [string]$ResourceGroup, [datetime]$From, [datetime]$To) {
+    $fmt = "yyyy-MM-dd'T'HH:mm:ss'Z'"; $inv = [cultureinfo]::InvariantCulture
+    $filter = "eventTimestamp ge '$($From.ToString($fmt, $inv))' and eventTimestamp le '$($To.ToString($fmt, $inv))' and resourceGroupName eq '$ResourceGroup'"
+    "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Insights/eventtypes/management/values?api-version=2015-04-01" +
+        "&`$filter=$([uri]::EscapeDataString($filter))&`$select=$([uri]::EscapeDataString('eventTimestamp,operationName,resourceId,status,caller,correlationId'))"
+}
+# Activity Log timestamps as sortable UTC text (ConvertFrom-Json may already have turned them into DateTime values)
+function Format-EventTime($Value) {
+    if ($Value -is [datetime]) { return (ConvertTo-UtcDate $Value).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [cultureinfo]::InvariantCulture) }
+    if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [cultureinfo]::InvariantCulture) }
+    return "$Value"
+}
+function Get-ResourceGroupKey([string]$Id) {
+    if ("$Id" -match '^/subscriptions/([^/]+)/resourceGroups/([^/]+)') { return "$($Matches[1])|$($Matches[2])".ToLowerInvariant() }
+    return ''
+}
+$changesFrom = ConvertTo-UtcDate $ChangesSince
+$changesTo = [datetime]::UtcNow
+if (-not $SkipChangeHistory) {
+    if ($changesFrom -ge $changesTo) { throw 'ChangesSince must be in the past.' }
+    if ($changesFrom -lt $changesTo.AddDays(-89)) {
+        Write-Warning "The Activity Log keeps 90 days; reading changes from $($changesTo.AddDays(-89).ToString('yyyy-MM-dd')) instead of $($changesFrom.ToString('yyyy-MM-dd'))."
+        $changesFrom = $changesTo.AddDays(-89)
+    }
+}
+$activityCache = @{}   # 'sub|rg' -> @{ ok; events }
+function Get-ResourceGroupEvents([string]$Key) {
+    if (-not $activityCache.ContainsKey($Key)) {
+        $sub, $rg = $Key -split '\|', 2
+        $before = $script:failures.Count
+        $events = @(Get-Paged (Get-ActivityLogUrl $sub $rg $changesFrom $changesTo))
+        $activityCache[$Key] = [pscustomobject]@{ ok = ($script:failures.Count -eq $before); events = $events }
+    }
+    $activityCache[$Key]
 }
 
 # =====================================================================================================
 # Analysis per instance
 # =====================================================================================================
-$nsgRows = @(); $pathways = @(); $policyRows = @(); $summary = @(); $patchRows = @()
+$nsgRows = @(); $pathways = @(); $policyRows = @(); $summary = @(); $patchRows = @(); $changeRows = @()
 $wafCache = @{}; $wafUse = @{}
 function New-UnknownWaf([string]$PolicyId, [string]$Kind) {
     [pscustomobject]@{ policyId = $PolicyId; policy = (Get-ResourceName $PolicyId); kind = $Kind; state = 'unknown'; mode = ''; verdict = 'UNKNOWN (policy not visible)'
@@ -1104,19 +1207,75 @@ foreach ($a in $apim) {
     # ---- Optional: gateway runtime patch level (NSM advisory) ----
     $patch = ''
     if ($CheckGatewayPatch) {
-        $gwHost = ($hosts | Where-Object { $_.type -eq 'Proxy' -and $_.isDefault } | Select-Object -First 1).host
-        $ver = ''; $note = ''
-        try {
-            $resp = Invoke-RestMethod -Uri "https://$gwHost/internal-status-0123456789abcdef" -TimeoutSec 20 -ErrorAction Stop
-            $ver = "$($resp.RuntimeVersion)"
-            if (-not $ver -and $resp.Version) { $note = "status endpoint answered without RuntimeVersion (Version=$($resp.Version))" }
-        } catch { $note = "status endpoint not reachable from here: $(($_.Exception.Message -split "`n")[0])" }
-        $patch = if ($ver) { Get-GatewayPatchStatus $ver } elseif ($note) { "unknown ($note)" } else { Get-GatewayPatchStatus '' }
-        $patchRows += [pscustomobject]@{ apim = $a.name; subscriptionId = $a.subscriptionId; gateway = $gwHost; runtimeVersion = $ver; patchStatus = $patch; note = $note }
+        $statuses = @()
+        if ($sc.tierFamily -in 'v2', 'Classic (Consumption)') {
+            $p = Get-GatewayPatchStatus '' $sc.tierFamily
+            $patchRows += [pscustomobject]@{ apim = $a.name; subscriptionId = $a.subscriptionId; region = "$($a.location)"; gateway = ''; runtimeVersion = ''; patchStatus = $p; note = 'not probed' }
+            $statuses += $p
+        } else {
+            foreach ($t in @(Get-GatewayProbeTargets $a)) {
+                $ver = ''; $note = ''
+                if ($t.disabled) { $p = 'not probed (gateway disabled in this region)' }
+                elseif (-not $t.host) { $p = 'unknown (no regional gateway URL in the resource data)' }
+                else {
+                    try {
+                        $resp = Invoke-RestMethod -Uri "https://$($t.host)/internal-status-0123456789abcdef" -TimeoutSec 20 -ErrorAction Stop
+                        $ver = "$($resp.RuntimeVersion)"
+                        if (-not $ver -and $resp.Version) { $note = "status endpoint answered without RuntimeVersion (Version=$($resp.Version))" }
+                    } catch {
+                        $note = "status endpoint not reachable from here: $(($_.Exception.Message -split "`n")[0])"
+                        if ("$($a.vnetType)" -ieq 'Internal') { $note += '; Internal mode: the gateway resolves to a private address, so rerun -CheckGatewayPatch from a machine inside (or peered with) the VNet' }
+                    }
+                    $p = if ($ver) { Get-GatewayPatchStatus $ver $sc.tierFamily } elseif ($note) { "unknown ($note)" } else { Get-GatewayPatchStatus '' $sc.tierFamily }
+                }
+                $patchRows += [pscustomobject]@{ apim = $a.name; subscriptionId = $a.subscriptionId; region = $t.region; gateway = $t.host; runtimeVersion = $ver; patchStatus = $p; note = $note }
+                $statuses += $p
+            }
+        }
+        $patch = Get-PatchSummary $statuses
+    }
+
+    $mineP = @($pathways | Where-Object { $_.apim -eq $a.name -and $_.subscriptionId -eq $a.subscriptionId })
+
+    # ---- Change history since -ChangesSince (Activity Log) ----
+    $changes = ''
+    if (-not $SkipChangeHistory) {
+        $watched = @()
+        foreach ($loc in $locations) {
+            if (-not $loc.subnetId) { continue }
+            $watched += "$($loc.subnetId)"
+            $sn = $subnets["$($loc.subnetId)".ToLower()]
+            if ($sn -and $sn.nsgId) { $watched += "$($sn.nsgId)" }
+        }
+        foreach ($p in @($mineP | Where-Object { $_.pathway -in 'Application Gateway', 'Front Door', 'Front Door (classic)', 'Azure Firewall DNAT', 'private endpoint' })) {
+            $watched += "$($p.viaId)"
+            if ($p.pathway -eq 'Azure Firewall DNAT') {
+                $fwPol = "$(($firewalls | Where-Object { "$($_.id)" -ieq "$($p.viaId)" } | Select-Object -First 1).properties.firewallPolicy.id)"
+                if ($fwPol) { $watched += $fwPol }
+            }
+        }
+        foreach ($k in @($wafUse.Keys)) { if ($k -notlike '*|inline' -and $wafUse[$k].Contains("$($a.name)")) { $watched += $k } }
+        $watched = @($watched | Where-Object { $_ } | ForEach-Object { "$_".TrimEnd('/').ToLowerInvariant() } | Sort-Object -Unique)
+        $rgKeys = @(@("$($a.id)") + $watched | ForEach-Object { Get-ResourceGroupKey $_ } | Where-Object { $_ } | Sort-Object -Unique)
+        $found = @(); $unread = @()
+        foreach ($rk in $rgKeys) {
+            $res = Get-ResourceGroupEvents $rk
+            if (-not $res.ok) { $unread += ($rk -split '\|')[1]; continue }
+            $found += @($res.events | Where-Object { Test-IngressChange $_ "$($a.id)" $watched })
+        }
+        $found = @($found | Sort-Object { Format-EventTime $_.eventTimestamp })
+        foreach ($e in $found) {
+            $changeRows += [pscustomobject]@{
+                apim = $a.name; subscriptionId = $a.subscriptionId; time = (Format-EventTime $e.eventTimestamp); operation = "$($e.operationName.value)"
+                resource = (Get-ResourceName "$($e.resourceId)"); caller = "$($e.caller)"; resourceId = "$($e.resourceId)"; correlationId = "$($e.correlationId)"
+            }
+        }
+        $since = $changesFrom.ToString('yyyy-MM-dd')
+        $changes = if ($found.Count) { "CHANGED: $($found.Count) change(s) since $since, last $(Format-EventTime $found[-1].eventTimestamp)" } elseif ($unread.Count) { "unknown (Activity Log not readable for $($unread -join ', '))" } else { "no changes since $since" }
+        if ($found.Count -and $unread.Count) { $changes += " (Activity Log not readable for $($unread -join ', '))" }
     }
 
     # ---- Status and summary ----
-    $mineP = @($pathways | Where-Object { $_.apim -eq $a.name -and $_.subscriptionId -eq $a.subscriptionId })
     $status = Get-IngressStatus $mineP $unchecked
     $wafP = @($mineP | Where-Object { $_.wafVerdict -ne 'n/a' })
     $summary += [pscustomobject]@{
@@ -1131,7 +1290,7 @@ foreach ($a in $apim) {
         ipFilter = $(if ($pol -and $pol.ipFilterAction) { "$($pol.ipFilterAction) ($($pol.ipFilterClass))$(if ($pol.ipFilterConditional) { ' conditional' })" } elseif ($SkipPolicy) { 'not read' } else { 'none' })
         fdidCheck = $(if ($pol) { $pol.fdidCheck } else { '' })
         directMgmtApi = $(if ($flags) { $flags.directMgmtApi } else { '' }); gitAccess = $(if ($flags) { $flags.gitAccess } else { '' })
-        gatewayPatch = $patch; scope = $sc.reason; basis = $reach.basis
+        gatewayPatch = $patch; changesSince = $(if ($SkipChangeHistory) { 'not read (-SkipChangeHistory)' } else { $changes }); scope = $sc.reason; basis = $reach.basis
     }
 }
 
@@ -1157,6 +1316,9 @@ $wafPolicyRows | Sort-Object kind, policy | Export-Csv (Join-Path $OutDir 'waf-p
 $wafRuleRows = @(foreach ($k in $wafCache.Keys) { foreach ($r in @($wafCache[$k].customRuleRows)) { $r | Select-Object policy, kind, rule, priority, enabled, ruleType, action, conditions, ipMatch, ipNegated, ipClass, assessment, policyId } })
 $wafRuleRows | Export-Csv (Join-Path $OutDir 'waf-custom-rules.csv')
 if ($CheckGatewayPatch) { $patchRows | Export-Csv (Join-Path $OutDir 'gateway-patch-status.csv') }
+if (-not $SkipChangeHistory) { $changeRows | Export-Csv (Join-Path $OutDir 'network-changes.csv') }
+$changed = @($summary | Where-Object { "$($_.changesSince)" -like 'CHANGED*' })
+$changeUnknown = @($summary | Where-Object { "$($_.changesSince)" -like 'unknown*' })
 
 function ConvertTo-MdTable($Rows, [string[]]$Cols) {
     $rows = @($Rows | Where-Object { $_ })
@@ -1195,10 +1357,13 @@ hostnames answer on 443. This report shows who on the internet can reach them, t
 | NSG allow rules admitting open, broad or multi-tenant sources on 3443 / 443 / 80 / other ports | $($nsgFindings.Count) |
 | WAF policies in use | $($wafPolicyRows.Count) (not in prevention mode or with permissive allows: $($weakWaf.Count)) |
 | Instances with a bypassable WAF | $(@($summary | Where-Object { $_.wafBypassable -eq $true }).Count) |
+| Instances whose ingress configuration changed since $($changesFrom.ToString('yyyy-MM-dd')) (today's state may not be the state during the exposure window) | $(if ($SkipChangeHistory) { 'not read' } else { "$($changed.Count)$(if ($changeUnknown.Count) { " (Activity Log not readable for $($changeUnknown.Count) more)" })" }) |
 
 ## Per instance
 
-$(ConvertTo-MdTable ($summary | Sort-Object @{ Expression = { switch ($_.ingressStatus) { 'OPEN' { 0 } 'BROAD' { 1 } 'UNCHECKED' { 2 } 'FILTERED' { 3 } default { 4 } } } }, apim) @('ingressStatus','apim','sku','vnetType','publicAccess','privateEndpoints','managementReach','gatewayReach','nsg3443','nsg443','wafVerdicts','wafBypassable','ipFilter','fdidCheck','directMgmtApi','gitAccess','gatewayPatch'))
+$(ConvertTo-MdTable ($summary | Sort-Object @{ Expression = { switch ($_.ingressStatus) { 'OPEN' { 0 } 'BROAD' { 1 } 'UNCHECKED' { 2 } 'FILTERED' { 3 } default { 4 } } } }, apim) @('ingressStatus','apim','sku','vnetType','publicAccess','privateEndpoints','managementReach','gatewayReach','nsg3443','nsg443','wafVerdicts','wafBypassable','ipFilter','fdidCheck','directMgmtApi','gitAccess','gatewayPatch','changesSince'))
+
+$(if (-not $SkipChangeHistory) { "## Changes since $($changesFrom.ToString('yyyy-MM-dd'))`n`nEverything above is today's configuration. These successful writes and deletes in the Activity Log touched an instance (service settings, private endpoint connections, global policy, tenant access), its subnets or NSGs, or a front end or WAF policy that reaches it. An instance listed here may have been more exposed during the incident than the tables above show: check what each change did before relying on its status. Details, including the caller, are in network-changes.csv.`n`n" + (ConvertTo-MdTable $changeRows @('apim','time','operation','resource','caller')) + $(if ($changeUnknown.Count) { "`n`nActivity Log not readable (no evidence either way): $(($changeUnknown | ForEach-Object { $_.apim }) -join ', '). See failed-calls.csv." }) })
 
 ## Permissive pathways
 
@@ -1218,7 +1383,7 @@ $(ConvertTo-MdTable ($wafPolicyRows | Sort-Object kind, policy) @('policy','kind
 
 Custom rules are listed in waf-custom-rules.csv. A custom Allow rule for an open or broad source range skips the managed rules for most of the internet; a Block rule with a negated address match is an allowlist.
 
-$(if ($CheckGatewayPatch) { "## Gateway runtime patch level`n`nPer the Norwegian NSM advisory (20 Nov 2026): 0.52.x is patched from build 31936, 0.53.x from 31938. Microsoft has not documented this endpoint; 'unknown' is not 'patched'.`n`n" + (ConvertTo-MdTable $patchRows @('apim','gateway','runtimeVersion','patchStatus','note')) })
+$(if ($CheckGatewayPatch) { "## Gateway runtime patch level`n`nPer the Norwegian NSM advisory (20 Nov 2026): 0.52.x is patched from build 31936, 0.53.x from 31938; builds such as 0.52.4150.0 or 0.53.4608.0 are NSM's v2 / Consumption pattern, which was not vulnerable. The thresholds are applied to Classic tiers only; a v2 or Consumption instance is not probed. UNRECOGNISED means the answer fits neither rule for the instance's tier: verify with Microsoft. Multi-region instances are probed per region. Microsoft has not documented this endpoint; 'unknown' is not 'patched'.`n`n" + (ConvertTo-MdTable $patchRows @('apim','region','gateway','runtimeVersion','patchStatus','note')) })
 
 ## What to do with an OPEN or BROAD instance
 
@@ -1231,6 +1396,7 @@ $(if ($CheckGatewayPatch) { "## Gateway runtime patch level`n`nPer the Norwegian
 
 ## Limits
 
+- The statuses describe today's configuration, not the configuration during the exposure window. The Activity Log check flags later changes but does not reconstruct the earlier state; it reads 90 days at most and covers the resources listed above, not, for example, a route table or a DNS record.
 - Reachability is inferred from configuration, not probed. Service tags are opaque: their address ranges are not expanded.
 - The subnet NSG is evaluated for internet reachability only. Partial denies are reported, not subtracted, and two partial denies that together cover an allow are not combined.
 - A Front Door security policy that covers only some path patterns of a route is credited for the whole route.
@@ -1249,7 +1415,9 @@ foreach ($s in ($summary | Sort-Object @{ Expression = { switch ($_.ingressStatu
         $(if ($s.nsg3443) { $s.nsg3443 } else { '-' }), $(if ($s.nsg443) { $s.nsg443 } else { '-' }),
         $(if ($s.wafVerdicts) { $s.wafVerdicts } else { 'none' }), $(if ($s.wafBypassable) { ' (BYPASSABLE)' } else { '' }),
         $s.ipFilter, $s.fdidCheck, $(if ($s.gatewayPatch) { " | patch: $($s.gatewayPatch)" } else { '' })) -ForegroundColor $color
+    if ("$($s.changesSince)" -like 'CHANGED*' -or "$($s.changesSince)" -like 'unknown*') { Write-Host "           $($s.apim): $($s.changesSince)" -ForegroundColor Yellow }
 }
+if ($changed.Count) { Write-Warning "$($changed.Count) instance(s) had ingress-relevant changes since $($changesFrom.ToString('yyyy-MM-dd')): $(($changed | ForEach-Object { $_.apim }) -join ', '). Their status reflects today's configuration, which may be tighter than during the exposure window. See network-changes.csv." }
 Write-Host @"
 
 Legend: OPEN      = the management endpoint (3443) or a 443 endpoint is reachable from the whole internet with nothing in front of it
@@ -1266,5 +1434,5 @@ Legend: OPEN      = the management endpoint (3443) or a 443 endpoint is reachabl
         BYPASSABLE = a WAF fronts the gateway, but the instance also answers directly from the internet and neither checks
                     X-Azure-FDID nor filters source addresses, so the WAF can be skipped.
 Output: ingress-summary.csv, ingress-pathways.csv, nsg-inbound-rules.csv, waf-policies.csv, waf-custom-rules.csv,
-        apim-policy-controls.csv$(if ($CheckGatewayPatch) { ', gateway-patch-status.csv' }), failed-calls.csv and ingress-report.md in $OutDir
+        apim-policy-controls.csv$(if ($CheckGatewayPatch) { ', gateway-patch-status.csv' })$(if (-not $SkipChangeHistory) { ', network-changes.csv' }), failed-calls.csv and ingress-report.md in $OutDir
 "@
