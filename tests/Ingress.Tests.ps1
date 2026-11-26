@@ -524,6 +524,19 @@ Describe 'Change history (Activity Log)' {
         @{ Case = 'a policy fragment'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/POLICYFRAGMENTS/WRITE' }
         @{ Case = 'a user deletion'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/USERS/DELETE' }
     ) { Test-IngressChange (New-Event $Op $script:apimId) $script:apimId $script:watch | Should -BeFalse }
+    It 'counts a change recorded by both Resource Manager and APIM once, keeping the record with a caller' {
+        $arm = New-Event 'Microsoft.ApiManagement/service/policies/write' "$($script:apimId)/policies/policy"
+        $arm | Add-Member correlationId 'c1'; $arm | Add-Member caller 'admin@contoso.test'
+        $own = New-Event 'MICROSOFT.APIMANAGEMENT/SERVICE/POLICIES/WRITE' $script:apimId.ToUpperInvariant()
+        $own | Add-Member correlationId 'C1'; $own | Add-Member caller ''
+        $other = New-Event 'MICROSOFT.APIMANAGEMENT/SERVICE/WRITE' $script:apimId
+        $other | Add-Member correlationId 'c1'; $other | Add-Member caller ''
+        $noId = New-Event 'MICROSOFT.APIMANAGEMENT/SERVICE/WRITE' $script:apimId
+        $noId | Add-Member correlationId ''; $noId | Add-Member caller ''
+        $u = @(Select-UniqueChange @($own, $arm, $other, $noId))
+        $u.Count | Should -Be 3
+        ($u | Where-Object { $_.operationName.value -like '*policies*' }).caller | Should -Be 'admin@contoso.test'
+    }
     It 'ignores a role assignment on the instance' {
         Test-IngressChange (New-Event 'Microsoft.Authorization/roleAssignments/write' "$($script:apimId)/providers/Microsoft.Authorization/roleAssignments/r1") $script:apimId $script:watch | Should -BeFalse
     }

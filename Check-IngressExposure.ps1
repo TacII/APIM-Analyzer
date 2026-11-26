@@ -901,6 +901,23 @@ function Test-IngressChange($Entry, [string]$ApimId, [string[]]$Watched) {
     }
     return $false
 }
+# One change can appear twice: Azure Resource Manager's record (mixed case, with a caller) and APIM's own (capitals,
+# no caller, the service as resourceId), sharing a correlationId. Keep one per correlationId and operation, preferring
+# the record that names a caller and the more specific resourceId. Events without a correlationId are all kept.
+function Select-UniqueChange($Entries) {
+    $byKey = [ordered]@{}; $rest = @()
+    foreach ($e in @($Entries)) {
+        $cid = "$($e.correlationId)".Trim()
+        if (-not $cid) { $rest += $e; continue }
+        $k = "$($cid.ToLowerInvariant())|$("$($e.operationName.value)".Trim().ToLowerInvariant())"
+        $cur = $byKey[$k]
+        if (-not $cur) { $byKey[$k] = $e; continue }
+        $better = (-not "$($cur.caller)".Trim() -and "$($e.caller)".Trim()) -or
+                  ("$($cur.caller)".Trim() -eq "$($e.caller)".Trim() -and "$($e.resourceId)".Length -gt "$($cur.resourceId)".Length)
+        if ($better) { $byKey[$k] = $e }
+    }
+    @($byKey.Values) + $rest
+}
 # Activity Log query for one resource group (the API filters by resource group, not by a resource and its children)
 function Get-ActivityLogUrl([string]$SubscriptionId, [string]$ResourceGroup, [datetime]$From, [datetime]$To) {
     $fmt = "yyyy-MM-dd'T'HH:mm:ss'Z'"; $inv = [cultureinfo]::InvariantCulture
@@ -1315,7 +1332,7 @@ foreach ($a in $apim) {
             if (-not $res.ok) { $unread += ($rk -split '\|')[1]; continue }
             $found += @($res.events | Where-Object { Test-IngressChange $_ "$($a.id)" $watched })
         }
-        $found = @($found | Sort-Object { Format-EventTime $_.eventTimestamp })
+        $found = @(Select-UniqueChange $found | Sort-Object { Format-EventTime $_.eventTimestamp })
         foreach ($e in $found) {
             $changeRows += [pscustomobject]@{
                 apim = $a.name; subscriptionId = $a.subscriptionId; time = (Format-EventTime $e.eventTimestamp); operation = "$($e.operationName.value)"
