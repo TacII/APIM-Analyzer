@@ -842,11 +842,11 @@ function Get-PatchSummary([string[]]$Statuses) {
 # children count (an NSG rule is a child of the NSG). For the instance itself only the service, its private endpoint
 # connections, the global policy (ip-filter / X-Azure-FDID) and the tenant access settings (direct management API, Git)
 # count: API, product and other content deployments do not change ingress.
-function Test-IngressChange($Event, [string]$ApimId, [string[]]$Watched) {
-    if ("$($Event.status.value)" -ine 'Succeeded') { return $false }
-    $op = "$($Event.operationName.value)"
+function Test-IngressChange($Entry, [string]$ApimId, [string[]]$Watched) {
+    if ("$($Entry.status.value)" -ine 'Succeeded') { return $false }
+    $op = "$($Entry.operationName.value)"
     if ($op -notmatch '/(write|delete)$' -and $op -notmatch '/applynetworkconfigurationupdates/action$') { return $false }
-    $rid = "$($Event.resourceId)".Trim().TrimEnd('/').ToLowerInvariant()
+    $rid = "$($Entry.resourceId)".Trim().TrimEnd('/').ToLowerInvariant()
     if (-not $rid) { return $false }
     $a = "$ApimId".Trim().TrimEnd('/').ToLowerInvariant()
     if ($a -and ($rid -eq $a -or $rid -eq "$a/policies/policy" -or $rid.StartsWith("$a/privateendpointconnections/") -or $rid.StartsWith("$a/tenant/"))) { return $true }
