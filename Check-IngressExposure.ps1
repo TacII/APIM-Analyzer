@@ -56,6 +56,11 @@ function Get-ArmToken {
 # Returns @{ ok; data } or @{ ok = $false; error }. Retries throttling (429) and server errors a few times. GET only,
 # plus the Resource Graph query POST: this script never changes anything.
 function Invoke-Arm([string]$Method, [string]$Url, $Body) {
+    # The bearer token goes to Azure Resource Manager only, also when following a nextLink taken from a response
+    $u = $null
+    if (-not [uri]::TryCreate("$Url", [UriKind]::Absolute, [ref]$u) -or $u.Scheme -ne 'https' -or $u.Host -ne 'management.azure.com') {
+        return [pscustomobject]@{ ok = $false; error = "refused: not an https://management.azure.com URL, the token is not sent there ($Url)" }
+    }
     for ($try = 1; ; $try++) {
         $p = @{ Method = $Method; Uri = $Url; Headers = @{ Authorization = "Bearer $(Get-ArmToken)" } }
         if ($null -ne $Body) { $p.Body = ($Body | ConvertTo-Json -Depth 10 -Compress); $p.ContentType = 'application/json' }

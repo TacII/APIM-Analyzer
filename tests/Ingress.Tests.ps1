@@ -396,6 +396,26 @@ Describe 'Get-GatewayPatchStatus (NSM thresholds)' {
     It 'defaults to the Classic rule' { Get-GatewayPatchStatus '0.52.31935.0' | Should -BeLike 'NOT PATCHED*' }
 }
 
+Describe 'Invoke-Arm sends the token to Azure Resource Manager only' {
+    BeforeAll {
+        Mock Get-ArmToken { throw 'Get-ArmToken must not be called for a refused URL' }
+        Mock Invoke-RestMethod { throw 'Invoke-RestMethod must not be called for a refused URL' }
+    }
+    It 'refuses <Url>' -TestCases @(
+        @{ Url = 'https://attacker.example/subscriptions/x?api-version=1' }
+        @{ Url = 'https://management.azure.com.attacker.example/x' }
+        @{ Url = 'http://management.azure.com/x' }
+        @{ Url = '/subscriptions/x' }
+        @{ Url = '' }
+    ) {
+        $r = Invoke-Arm GET $Url
+        $r.ok | Should -BeFalse
+        $r.error | Should -BeLike 'refused:*'
+        Should -Invoke Get-ArmToken -Times 0 -Exactly
+        Should -Invoke Invoke-RestMethod -Times 0 -Exactly
+    }
+}
+
 Describe 'Gateway probe targets and the per-instance patch summary' {
     It 'probes only the default hostname of a single-region instance' {
         $t = @(Get-GatewayProbeTargets ([pscustomobject]@{ name = 'apim-one'; location = 'westeurope'; additionalLocations = @(); gatewayRegionalUrl = 'https://apim-one-westeurope-01.regional.azure-api.net' }))
