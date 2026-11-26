@@ -53,8 +53,47 @@ function Get-ArmToken {
     }
     return $script:armToken.value
 }
-# Returns @{ ok; data } or @{ ok = $false; error }. Retries throttling (429) and server errors a few times. GET only,
-# plus the Resource Graph query POST: this script never changes anything.
+# Seconds the server asks us to wait (Retry-After as seconds or as a date), or $null when it does not say
+function Get-RetryAfterSeconds($Response) {
+    if (-not $Response) { return $null }
+    $h = $null; try { $h = $Response.Headers } catch { }
+    if (-not $h) { return $null }
+    try {
+        $ra = $h.RetryAfter   # HttpResponseHeaders (PowerShell 7)
+        if ($ra -and $null -ne $ra.Delta) { return [int][Math]::Ceiling($ra.Delta.TotalSeconds) }
+        if ($ra -and $null -ne $ra.Date) { return [int][Math]::Max(0, [Math]::Ceiling(($ra.Date - [DateTimeOffset]::UtcNow).TotalSeconds)) }
+    } catch { }
+    $raw = $null
+    try { $raw = $h['Retry-After'] } catch { }
+    if ("$raw" -match '^\s*(\d+)\s*$') { return [int]$Matches[1] }
+    return $null
+}
+# A dropped or reset connection, a DNS hiccup or a timeout: no HTTP status, worth another try
+function Test-TransportError($Exception) {
+    $names = 'System.Net.Http.HttpRequestException', 'System.IO.IOException', 'System.Net.Sockets.SocketException', 'System.TimeoutException', 'System.Threading.Tasks.TaskCanceledException'
+    for ($e = $Exception; $e; $e = $e.InnerException) {
+        for ($t = $e.GetType(); $t; $t = $t.BaseType) {
+            if ($t.FullName -in $names) { return $true }
+            if ($t.FullName -eq 'System.Net.WebException' -and -not $e.Response) { return $true }
+        }
+    }
+    return $false
+}
+# Seconds to wait before attempt $Try + 1, or $null to give up. Throttling (429) waits as long as Retry-After asks,
+# or 5, 10, 20, 40, 60 seconds: the Activity Log allows 50 requests per 30 seconds per subscription, so shorter
+# backoffs run out before the window resets. Server errors and transport errors back off 2, 4, 8, 16, 32 seconds.
+function Get-RetryDelay($Exception, [int]$Code, [int]$Try, [int]$MaxTries = 6) {
+    if ($Try -ge $MaxTries) { return $null }
+    if ($Code -eq 429) {
+        $after = Get-RetryAfterSeconds $(try { $Exception.Response } catch { $null })
+        if ($null -ne $after) { return [int][Math]::Min([Math]::Max($after, 1), 120) }
+        return [int][Math]::Min(5 * [Math]::Pow(2, $Try - 1), 60)
+    }
+    if ($Code -ge 500 -or ($Code -eq 0 -and (Test-TransportError $Exception))) { return [int][Math]::Pow(2, $Try) }
+    return $null
+}
+# Returns @{ ok; data } or @{ ok = $false; error }. Retries throttling (429), server errors and dropped connections.
+# GET only, plus the Resource Graph query POST: this script never changes anything.
 function Invoke-Arm([string]$Method, [string]$Url, $Body) {
     # The bearer token goes to Azure Resource Manager only, also when following a nextLink taken from a response
     $u = $null
@@ -67,7 +106,8 @@ function Invoke-Arm([string]$Method, [string]$Url, $Body) {
         try { return [pscustomobject]@{ ok = $true; data = (Invoke-RestMethod @p) } }
         catch {
             $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch { }
-            if ($try -lt 4 -and ($code -eq 429 -or $code -ge 500)) { Start-Sleep -Seconds ([Math]::Pow(2, $try)); continue }
+            $wait = Get-RetryDelay $_.Exception $code $try
+            if ($null -ne $wait) { Start-Sleep -Seconds $wait; continue }
             $msg = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
             return [pscustomobject]@{ ok = $false; error = "HTTP $code $msg" }
         }
@@ -842,14 +882,19 @@ function Get-PatchSummary([string[]]$Statuses) {
 # children count (an NSG rule is a child of the NSG). For the instance itself only the service, its private endpoint
 # connections, the global policy (ip-filter / X-Azure-FDID) and the tenant access settings (direct management API, Git)
 # count: API, product and other content deployments do not change ingress.
+# APIM's own change records (operation names in capitals, no caller) carry the service itself as resourceId, also for
+# a change to an API, a subscription or a named value. So for the instance the operation decides, not the resourceId.
 function Test-IngressChange($Entry, [string]$ApimId, [string[]]$Watched) {
     if ("$($Entry.status.value)" -ine 'Succeeded') { return $false }
-    $op = "$($Entry.operationName.value)"
+    $op = "$($Entry.operationName.value)".Trim().ToLowerInvariant()
     if ($op -notmatch '/(write|delete)$' -and $op -notmatch '/applynetworkconfigurationupdates/action$') { return $false }
     $rid = "$($Entry.resourceId)".Trim().TrimEnd('/').ToLowerInvariant()
     if (-not $rid) { return $false }
     $a = "$ApimId".Trim().TrimEnd('/').ToLowerInvariant()
-    if ($a -and ($rid -eq $a -or $rid -eq "$a/policies/policy" -or $rid.StartsWith("$a/privateendpointconnections/") -or $rid.StartsWith("$a/tenant/"))) { return $true }
+    if ($a -and ($rid -eq $a -or $rid.StartsWith("$a/"))) {
+        return ($op -match '^microsoft\.apimanagement/service/(write|delete|applynetworkconfigurationupdates/action|policies/(write|delete))$' -or
+                $op -match '^microsoft\.apimanagement/service/(privateendpointconnections|tenant)/')
+    }
     foreach ($w in @($Watched | Where-Object { $_ })) {
         $wl = "$w".Trim().TrimEnd('/').ToLowerInvariant()
         if ($rid -eq $wl -or $rid.StartsWith("$wl/")) { return $true }
@@ -1000,7 +1045,9 @@ foreach ($a in $apim) {
     # ---- Global policy: ip-filter allowlists and the X-Azure-FDID check ----
     $pol = $null
     if (-not $SkipPolicy) {
-        $pres = Get-One "$base$($a.id)/policies/policy?format=rawxml&$apimApi"
+        # format=xml: policy expressions come back XML-escaped, so the document parses. rawxml leaves them as written
+        # (for example @(a < b && c)), which is not valid XML.
+        $pres = Get-One "$base$($a.id)/policies/policy?format=xml&$apimApi"
         if ($pres) {
             if ("$($pres.properties.format)" -like '*link*') { $pol = Get-PolicyIngressControls ''; $pol.note = "global policy is a link ($($pres.properties.format)); not read" }
             else { $pol = Get-PolicyIngressControls "$($pres.properties.value)" $TightPrefixLength $TightPrefixLengthV6 }

@@ -416,6 +416,46 @@ Describe 'Invoke-Arm sends the token to Azure Resource Manager only' {
     }
 }
 
+Describe 'Retrying throttled and dropped calls' {
+    It 'waits as long as Retry-After asks on a 429 (<Case>)' -TestCases @(
+        @{ Case = 'header as text'; Headers = @{ 'Retry-After' = '17' }; Expected = 17 }
+        @{ Case = 'typed header'; Headers = [pscustomobject]@{ RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([timespan]::FromSeconds(12)) }; Expected = 12 }
+    ) {
+        $ex = [pscustomobject]@{ Response = [pscustomobject]@{ Headers = $Headers } }
+        Get-RetryDelay $ex 429 1 | Should -Be $Expected
+    }
+    It 'backs off long enough on a 429 without Retry-After to outlast a 30-second window' {
+        $ex = [pscustomobject]@{ Response = $null }
+        $total = 0; foreach ($t in 1..5) { $total += Get-RetryDelay $ex 429 $t }
+        $total | Should -BeGreaterThan 60
+        Get-RetryDelay $ex 429 6 | Should -BeNullOrEmpty
+    }
+    It 'retries a server error' { Get-RetryDelay ([System.Exception]::new('x')) 503 1 | Should -Be 2 }
+    It 'retries a reset connection (no HTTP status)' {
+        $ex = [System.Net.Http.HttpRequestException]::new('Unable to read data from the transport connection', [System.IO.IOException]::new('reset'))
+        Get-RetryDelay $ex 0 1 | Should -Be 2
+    }
+    It 'does not retry <Case>' -TestCases @(
+        @{ Case = 'a 403'; Code = 403; Ex = [System.Exception]::new('forbidden') }
+        @{ Case = 'a 404'; Code = 404; Ex = [System.Exception]::new('not found') }
+        @{ Case = 'a non-network failure without status'; Code = 0; Ex = [System.ArgumentException]::new('bad') }
+    ) { Get-RetryDelay $Ex $Code 1 | Should -BeNullOrEmpty }
+    It 'Invoke-Arm recovers from a dropped connection' {
+        $script:calls = 0
+        Mock Get-ArmToken { 'token' }
+        Mock Start-Sleep { }
+        Mock Invoke-RestMethod {
+            $script:calls++
+            if ($script:calls -eq 1) { throw [System.Net.Http.HttpRequestException]::new('Unable to read data from the transport connection', [System.IO.IOException]::new('reset')) }
+            [pscustomobject]@{ value = @() }
+        }
+        $r = Invoke-Arm GET 'https://management.azure.com/subscriptions/s1/resourcegroups?api-version=2021-04-01'
+        $r.ok | Should -BeTrue
+        Should -Invoke Invoke-RestMethod -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly
+    }
+}
+
 Describe 'Gateway probe targets and the per-instance patch summary' {
     It 'probes only the default hostname of a single-region instance' {
         $t = @(Get-GatewayProbeTargets ([pscustomobject]@{ name = 'apim-one'; location = 'westeurope'; additionalLocations = @(); gatewayRegionalUrl = 'https://apim-one-westeurope-01.regional.azure-api.net' }))
@@ -471,7 +511,22 @@ Describe 'Change history (Activity Log)' {
         @{ Case = 'tenant access (direct management API)'; Op = 'Microsoft.ApiManagement/service/tenant/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/tenant/access' }
         @{ Case = 'a private endpoint connection'; Op = 'Microsoft.ApiManagement/service/privateEndpointConnections/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/privateEndpointConnections/pe1' }
         @{ Case = 'applying a network configuration update'; Op = 'Microsoft.ApiManagement/service/applynetworkconfigurationupdates/action'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a' }
+        @{ Case = 'an APIM change record of a service update (capitals, service as resourceId)'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/WRITE'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a' }
+        @{ Case = 'an APIM change record of the global policy'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/POLICIES/WRITE'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a' }
     ) { Test-IngressChange (New-Event $Op $Rid) $script:apimId $script:watch | Should -BeTrue }
+    # APIM's own change records name the service as resourceId whatever was changed, so these must be told apart by operation
+    It 'ignores the APIM change record of <Case>' -TestCases @(
+        @{ Case = 'a subscription write'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/SUBSCRIPTIONS/WRITE' }
+        @{ Case = 'a named-value deletion'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/NAMEDVALUES/DELETE' }
+        @{ Case = 'an operation policy'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/APIS/OPERATIONS/POLICIES/WRITE' }
+        @{ Case = 'an API policy'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/APIS/POLICIES/WRITE' }
+        @{ Case = 'a product-API link'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/PRODUCTS/APIS/WRITE' }
+        @{ Case = 'a policy fragment'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/POLICYFRAGMENTS/WRITE' }
+        @{ Case = 'a user deletion'; Op = 'MICROSOFT.APIMANAGEMENT/SERVICE/USERS/DELETE' }
+    ) { Test-IngressChange (New-Event $Op $script:apimId) $script:apimId $script:watch | Should -BeFalse }
+    It 'ignores a role assignment on the instance' {
+        Test-IngressChange (New-Event 'Microsoft.Authorization/roleAssignments/write' "$($script:apimId)/providers/Microsoft.Authorization/roleAssignments/r1") $script:apimId $script:watch | Should -BeFalse
+    }
     It 'ignores <Case>' -TestCases @(
         @{ Case = 'an API deployment'; Op = 'Microsoft.ApiManagement/service/apis/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/apis/orders'; Status = 'Succeeded' }
         @{ Case = 'an API-level policy'; Op = 'Microsoft.ApiManagement/service/apis/policies/write'; Rid = '/subscriptions/s1/resourceGroups/rg-apim/providers/Microsoft.ApiManagement/service/apim-a/apis/orders/policies/policy'; Status = 'Succeeded' }

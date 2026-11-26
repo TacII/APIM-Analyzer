@@ -85,7 +85,7 @@ BeforeAll {
             $name = $Matches[1]
             $p = $script:fixture.policies | Where-Object { $_.apim -eq $name } | Select-Object -First 1
             $xml = if ($p) { $p.xml } else { $script:fixture.defaultPolicyXml }
-            return [pscustomobject]@{ properties = [pscustomobject]@{ format = 'rawxml'; value = $xml } }
+            return [pscustomobject]@{ properties = [pscustomobject]@{ format = 'xml'; value = $xml } }
         }
         throw "unexpected ARM get: $Url"
     }
